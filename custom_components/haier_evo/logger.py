@@ -1,7 +1,5 @@
-
 import logging
 
-
-logging.getLogger("websocket").setLevel(logging.CRITICAL)
+# The level is left to the `logger:` section of configuration.yaml. It used to
+# be forced to INFO here, which silently ignored `custom_components.haier_evo: debug`.
 _LOGGER = logging.getLogger("custom_components.haier_evo")
-_LOGGER.setLevel(logging.INFO)
