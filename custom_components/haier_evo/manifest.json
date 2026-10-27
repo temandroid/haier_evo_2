@@ -1,14 +1,16 @@
 {
   "domain": "haier_evo",
   "name": "Haier Evo",
-  "codeowners": ["@and7ey"],
+  "codeowners": [
+    "@temandroid",
+    "@and7ey"
+  ],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/and7ey/haier_evo",
-  "homekit": {},
-  "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/and7ey/haier_evo/issues",
-  "requirements": ["requests", "websocket-client", "ratelimit"],
-  "version": "0.3.15",
-  "zeroconf": []
+  "documentation": "https://github.com/temandroid/haier_evo_2",
+  "integration_type": "hub",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/temandroid/haier_evo_2/issues",
+  "requirements": [],
+  "version": "0.4.0-dev"
 }

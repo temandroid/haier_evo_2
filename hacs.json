@@ -1,5 +1,6 @@
 {
   "name": "Haier Evo",
-  "homeassistant": "2024.12.0",
-  "country": "RU"
+  "homeassistant": "2025.2.0",
+  "country": "RU",
+  "render_readme": true
 }
