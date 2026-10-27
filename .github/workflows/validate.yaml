@@ -20,3 +20,6 @@ jobs:
         uses: hacs/action@main
         with:
           category: integration
+          # license: upstream and7ey/haier_evo has none, the fork cannot add one.
+          # issues, topics: repository settings of the fork, not code.
+          ignore: license issues topics
