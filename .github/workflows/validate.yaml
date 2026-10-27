@@ -3,16 +3,23 @@ name: Validate
 on:
   push:
   pull_request:
-  # schedule:
-  #   - cron: "0 0 * * *"
   workflow_dispatch:
 
 jobs:
-  validate-hacs:
-    runs-on: "ubuntu-latest"
+  hassfest:
+    runs-on: ubuntu-latest
     steps:
-      - uses: "actions/checkout@v3"
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master
+
+  hacs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - name: HACS validation
-        uses: "hacs/action@main"
+        uses: hacs/action@main
         with:
-          category: "integration"
+          category: integration
+          # license: upstream and7ey/haier_evo has none, the fork cannot add one.
+          # issues, topics: repository settings of the fork, not code.
+          ignore: license issues topics

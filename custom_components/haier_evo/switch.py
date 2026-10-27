@@ -1,20 +1,19 @@
-import weakref
+from __future__ import annotations
+
 from homeassistant.components.switch import SwitchEntity
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from .const import DOMAIN
+
 from . import api
 
 
-async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entities) -> bool:
-    haier_object = hass.data[DOMAIN][config_entry.entry_id]
+async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entities) -> None:
+    haier_object: api.Haier = config_entry.runtime_data
     entities = []
     for device in haier_object.devices:
         entities.extend(device.create_entities_switch())
-    entities.append(HttpSwitch(haier_object))
-    entities.append(HttpSwitchPOST(haier_object))
-    async_add_entities(entities)
-    haier_object.write_ha_state()
-    return True
+    if entities:
+        async_add_entities(entities)
 
 
 class HaierSwitch(SwitchEntity):
@@ -22,10 +21,11 @@ class HaierSwitch(SwitchEntity):
     _attr_icon = "mdi:toggle-switch"
 
     def __init__(self, device: api.HaierDevice) -> None:
-        self._device = weakref.proxy(device)
+        self._device = device
         self._device_attr_name = None
 
-        device.add_write_ha_state_callback(self.async_write_ha_state)
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self._device.add_listener(self.async_write_ha_state))
 
     @property
     def device_info(self) -> dict:
@@ -35,21 +35,17 @@ class HaierSwitch(SwitchEntity):
     def available(self) -> bool:
         return self._device.available
 
-    async def async_turn_on(self, **kwargs):
-        await self.hass.async_add_executor_job(self.turn_on)
-
-    def turn_on(self) -> None:
+    async def _async_set(self, value: bool) -> None:
         method = getattr(self._device, f"set_{self._device_attr_name}", None)
         if method is not None:
-            method(True)
+            await method(value)
+            self.async_write_ha_state()
 
-    async def async_turn_off(self, **kwargs):
-        await self.hass.async_add_executor_job(self.turn_off)
+    async def async_turn_on(self, **kwargs) -> None:
+        await self._async_set(True)
 
-    def turn_off(self, **kwargs) -> None:
-        method = getattr(self._device, f"set_{self._device_attr_name}", None)
-        if method is not None:
-            method(False)
+    async def async_turn_off(self, **kwargs) -> None:
+        await self._async_set(False)
 
     @property
     def is_on(self) -> bool:
@@ -58,6 +54,7 @@ class HaierSwitch(SwitchEntity):
 
 class HaierACLightSwitch(HaierSwitch):
     _attr_icon = "mdi:lightbulb"
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
@@ -67,6 +64,7 @@ class HaierACLightSwitch(HaierSwitch):
 
 
 class HaierACSoundSwitch(HaierSwitch):
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
@@ -76,6 +74,8 @@ class HaierACSoundSwitch(HaierSwitch):
 
 
 class HaierACQuietSwitch(HaierSwitch):
+    # Duplicates the climate preset "sleep" (same code); kept for automations.
+    _attr_entity_registry_enabled_default = False
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
@@ -85,6 +85,8 @@ class HaierACQuietSwitch(HaierSwitch):
 
 
 class HaierACTurboSwitch(HaierSwitch):
+    # Duplicates the climate preset "boost" (same code); kept for automations.
+    _attr_entity_registry_enabled_default = False
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
@@ -112,6 +114,7 @@ class HaierACComfortSwitch(HaierSwitch):
 
 
 class HaierACCleaningSwitch(HaierSwitch):
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
@@ -121,6 +124,7 @@ class HaierACCleaningSwitch(HaierSwitch):
 
 
 class HaierACAntiFreezeSwitch(HaierSwitch):
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
@@ -130,6 +134,7 @@ class HaierACAntiFreezeSwitch(HaierSwitch):
 
 
 class HaierACAutoHumiditySwitch(HaierSwitch):
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
@@ -163,52 +168,3 @@ class HaierREFVacationSwitch(HaierSwitch):
         self._device_attr_name = "vacation_mode"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_vacation_mode_switch"
         self._attr_name = f"{device.device_name} Режим Отпуск"
-
-
-class HttpSwitch(SwitchEntity):
-    _attr_icon = "mdi:toggle-switch"
-
-    def __init__(self, haier):
-        self._haier = weakref.proxy(haier)
-        self._attr_unique_id = f"{DOMAIN}_http_switch_get"
-        self._attr_name = "Haier Evo HTTP GET"
-
-    @property
-    def is_on(self) -> bool:
-        return self._haier.allow_http
-
-    @property
-    def device_info(self) -> dict:
-        return {
-            "identifiers": {(DOMAIN, f"{DOMAIN}_http_switch")},
-            "name": "Haier Evo HTTP",
-            "manufacturer": "Haier"
-        }
-
-    async def async_turn_on(self, **kwargs):
-        self._haier.allow_http = True
-        self.async_write_ha_state()
-
-    async def async_turn_off(self, **kwargs):
-        self._haier.allow_http = False
-        self.async_write_ha_state()
-
-
-class HttpSwitchPOST(HttpSwitch):
-
-    def __init__(self, haier):
-        super().__init__(haier)
-        self._attr_unique_id = f"{DOMAIN}_http_switch_post"
-        self._attr_name = "Haier Evo HTTP POST"
-
-    @property
-    def is_on(self) -> bool:
-        return self._haier.allow_http_post
-
-    async def async_turn_on(self, **kwargs):
-        self._haier.allow_http_post = True
-        self.async_write_ha_state()
-
-    async def async_turn_off(self, **kwargs):
-        self._haier.allow_http_post = False
-        self.async_write_ha_state()

@@ -1,29 +1,35 @@
-import weakref
-from homeassistant.components.binary_sensor import BinarySensorEntity
+from __future__ import annotations
+
+from typing import Any
+
+from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+)
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from .const import DOMAIN
+
 from . import api
 
 
-async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entities) -> bool:
-    haier_object = hass.data[DOMAIN][config_entry.entry_id]
+async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entities) -> None:
+    haier_object: api.Haier = config_entry.runtime_data
     entities = []
     for device in haier_object.devices:
         entities.extend(device.create_entities_binary_sensor())
     if entities:
         async_add_entities(entities)
-        haier_object.write_ha_state()
-    return True
 
 
 class HaierBinarySensor(BinarySensorEntity):
     _attr_should_poll = False
 
     def __init__(self, device: api.HaierDevice) -> None:
-        self._device = weakref.proxy(device)
+        self._device = device
         self._device_attr_name = None
 
-        device.add_write_ha_state_callback(self.async_write_ha_state)
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self._device.add_listener(self.async_write_ha_state))
 
     @property
     def device_info(self) -> dict:
@@ -76,3 +82,23 @@ class HaierREFSuperCoolingSensor(HaierREFBinarySensor):
         self._device_attr_name = "super_cooling"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_super_cooling"
         self._attr_name = f"{device.device_name} Супер-охлаждение"
+
+
+class HaierACProblemSensor(HaierBinarySensor):
+    """On while the unit reports alarms; texts come from the cloud's error table."""
+
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, device: api.HaierAC) -> None:
+        super().__init__(device)
+        self._attr_unique_id = f"{device.device_id}_{device.device_model}_problem"
+        self._attr_name = f"{device.device_name} Ошибка"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._device.alarms)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"alarms": self._device.alarms, "errors": self._device.alarm_texts}

@@ -1,28 +1,43 @@
 {
     "config": {
-        "abort": {
-            "already_configured": "already configured"
-        },
-        "error": {
-            "cannot_connect": "cannot connect",
-            "invalid_auth": "invalid_auth",
-            "unknown": "unknown"
-        },
         "step": {
             "user": {
+                "title": "Аккаунт Haier Evo",
+                "description": "Логин и пароль от приложения Evo. Если аккаунт заведён через Яндекс ID, пароля у него нет: задайте его через «Забыли пароль» в приложении Evo.",
                 "data": {
-                    "password": "Пароль",
                     "email": "Логин (email)",
+                    "password": "Пароль",
                     "region": "Регион"
                 }
             },
-            "init": {
+            "reauth_confirm": {
+                "title": "Haier Evo: войти заново",
+                "description": "Haier Evo не принял сохранённый пароль для {email}. Введите текущий.",
                 "data": {
-                    "password": "Пароль",
+                    "password": "Пароль"
+                }
+            },
+            "reconfigure": {
+                "title": "Аккаунт Haier Evo",
+                "data": {
                     "email": "Логин (email)",
+                    "password": "Пароль",
                     "region": "Регион"
                 }
             }
+        },
+        "error": {
+            "invalid_auth": "Неверный email или пароль",
+            "invalid_email": "Укажите email аккаунта Evo",
+            "cannot_connect": "Облако Haier Evo недоступно, попробуйте позже",
+            "too_many_requests": "Haier Evo ответил 429 (слишком много запросов). Подождите несколько минут и повторите",
+            "unknown": "Неожиданная ошибка, подробности в логе"
+        },
+        "abort": {
+            "already_configured": "Этот аккаунт уже добавлен",
+            "reauth_successful": "Вход выполнен",
+            "reconfigure_successful": "Настройки обновлены",
+            "wrong_account": "Для другого аккаунта добавьте новую запись интеграции"
         }
     },
     "entity": {
@@ -77,6 +92,23 @@
                     "on": "Активен"
                 }
             }
+        }
+    },
+    "exceptions": {
+        "command_failed": {
+            "message": "Haier Evo: нет связи с облаком, команда не отправлена"
+        },
+        "locked_off": {
+            "message": "{device} выключен: «{attribute}» нельзя изменить, пока он не включён"
+        },
+        "locked_mode": {
+            "message": "{device}: «{attribute}» в текущем режиме изменить нельзя"
+        },
+        "locked_alarm": {
+            "message": "{device} сообщает об ошибке: «{attribute}» изменить нельзя"
+        },
+        "value_not_allowed": {
+            "message": "{device}: значение {value} для «{attribute}» в текущем режиме недоступно"
         }
     }
 }
