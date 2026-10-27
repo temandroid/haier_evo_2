@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from homeassistant.components.binary_sensor import BinarySensorEntity
+from typing import Any
+
+from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+)
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 
 from . import api
@@ -76,3 +82,23 @@ class HaierREFSuperCoolingSensor(HaierREFBinarySensor):
         self._device_attr_name = "super_cooling"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_super_cooling"
         self._attr_name = f"{device.device_name} Супер-охлаждение"
+
+
+class HaierACProblemSensor(HaierBinarySensor):
+    """On while the unit reports alarms; texts come from the cloud's error table."""
+
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, device: api.HaierAC) -> None:
+        super().__init__(device)
+        self._attr_unique_id = f"{device.device_id}_{device.device_model}_problem"
+        self._attr_name = f"{device.device_name} Ошибка"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._device.alarms)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"alarms": self._device.alarms, "errors": self._device.alarm_texts}

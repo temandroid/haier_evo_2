@@ -97,6 +97,18 @@
     "exceptions": {
         "command_failed": {
             "message": "Haier Evo: no connection to the cloud, the command was not sent"
+        },
+        "locked_off": {
+            "message": "{device} is off: “{attribute}” cannot be changed until it is turned on"
+        },
+        "locked_mode": {
+            "message": "{device}: “{attribute}” cannot be changed in the current mode"
+        },
+        "locked_alarm": {
+            "message": "{device} reports an error: “{attribute}” cannot be changed"
+        },
+        "value_not_allowed": {
+            "message": "{device}: “{attribute}” = {value} is not available in the current mode"
         }
     }
 }

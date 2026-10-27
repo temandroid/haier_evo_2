@@ -50,6 +50,10 @@ class HaierCommandError(HomeAssistantError):
     """Command could not be delivered to the Haier Evo cloud."""
 
 
+class HaierCommandLocked(HomeAssistantError):
+    """The cloud marks the attribute read-only in the current state (modifiers)."""
+
+
 class HaierEmptyDeviceList(HaierError):
     """The cloud answered with no devices (upstream #105)."""
 
@@ -442,6 +446,7 @@ class HaierDevice:
         self._online = True
         self._config = None
         self._status_data = backend_data
+        self.alarms: list[str] = []
 
     def __repr__(self) -> str:
         return (
@@ -504,8 +509,31 @@ class HaierDevice:
             "device_model": self.device_model,
             "sw_version": self.sw_version,
             "config": self.config.to_dict() if self.config else None,
+            "alarms": self.alarms,
             "backend_data": self.status_data,
         }
+
+    def _set_alarms(self, alarms: Any) -> None:
+        # Live units send an empty list; entries are taken as alarm names
+        # ("indoorFanErr") or dicts carrying one, since no live alarm was seen yet.
+        names = []
+        for alarm in alarms if isinstance(alarms, list) else []:
+            if isinstance(alarm, dict):
+                alarm = alarm.get("name") or alarm.get("alarmName") or alarm.get("code")
+            if alarm:
+                names.append(str(alarm))
+        self.alarms = names
+
+    @property
+    def alarm_texts(self) -> list[str]:
+        """Human-readable alarms from the cloud's own table (errors.alarmToResult)."""
+        errors = (self.status_data or {}).get("errors") or {}
+        table = errors.get("alarmToResult") or {}
+        unknown = (errors.get("undefinedAlarm") or {}).get("text") or "Unknown error"
+        return [
+            (table.get(alarm) or {}).get("text") or f"{unknown} ({alarm})"
+            for alarm in self.alarms
+        ]
 
     def _get_status(self, data: dict) -> dict:
         self._status_data = data = (data or {})
@@ -518,6 +546,7 @@ class HaierDevice:
         settings = data.setdefault("settings", {})
         self.device_name = (settings.get("name") or {}).get("name") or self.device_name
         self.sw_version = (settings.get("firmware") or {}).get("value")
+        self._set_alarms(data.get("alarms"))
         # read config and current values
         self._load_config_from_attributes(data)
         return data
@@ -528,6 +557,7 @@ class HaierDevice:
             return
         self._status_data = data
         self.available = data.get("status") or "ONLINE"
+        self._set_alarms(data.get("alarms"))
         for attr in data.get("attributes") or []:
             if isinstance(attr, dict) and attr.get("currentValue") is not None:
                 self._set_attribute_value(str(attr.get("name")), attr.get("currentValue"))
@@ -544,6 +574,8 @@ class HaierDevice:
             properties = (status or {}).get("properties") or {}
             for key, value in properties.items():
                 self._set_attribute_value(key, value)
+            if isinstance(status, dict) and "alarms" in status:
+                self._set_alarms(status["alarms"])
         self.available = True
         self.notify()
 
@@ -683,6 +715,7 @@ class HaierAC(HaierDevice):
     ) -> None:
         super().__init__(**kwargs)
         self.current_temperature: float | None = None
+        self.outdoor_temperature: float | None = None
         self.target_temperature: float | None = None
         self.target_temperature_step: float = 1.0
         self.status = None
@@ -703,6 +736,9 @@ class HaierAC(HaierDevice):
         self.antifreeze_on = False
         self.autohumidity_on = False
         self.eco_sensor = None
+        # Raw attribute values by code, as the cloud sends them: modifiers are
+        # written against these, not against our parsed state.
+        self._raw: dict[str, str] = {}
         self._get_status(backend_data)
 
     @property
@@ -727,6 +763,7 @@ class HaierAC(HaierDevice):
         data = super().to_dict()
         data.update({
             "current_temperature": self.current_temperature,
+            "outdoor_temperature": self.outdoor_temperature,
             "target_temperature": self.target_temperature,
             "max_temperature": self.max_temperature,
             "min_temperature": self.min_temperature,
@@ -755,12 +792,15 @@ class HaierAC(HaierDevice):
         # the switches never followed the unit (upstream #67).
         if value is None:
             return
+        self._raw[str(code)] = str(value)
         for attr in self.config.get_attrs_by_code(code):
             self._apply_attribute(attr, value)
 
     def _apply_attribute(self, attr: CFG.Attribute, value: str) -> None:
         if attr.name == "current_temperature":
             self.current_temperature = parsefloat(value, self.current_temperature)
+        elif attr.name == "outdoor_temperature":
+            self.outdoor_temperature = parsefloat(value, self.outdoor_temperature)
         elif attr.name == "status":
             self.status = 1 if parsebool(str(value)) else 0
         elif attr.name == "target_temperature":
@@ -806,7 +846,12 @@ class HaierAC(HaierDevice):
         attrs = list(sorted(map(lambda x: CFG.Attribute(x), attributes), key=lambda x: x.code))
         for attr in attrs:
             if attr.name == "current_temperature" and str(attr.code) != sensor_curr_temp:
-                continue
+                if sensor_curr_temp is None:
+                    continue
+                # The second "room temperature" (code 38 on S2SF and PHP3) follows
+                # the outdoor unit: 11-13 °C on idle units at 8-10 °C outside,
+                # warmer while the unit runs. The indoor one is named in sensors.
+                attr = CFG.Attribute({**attr, "attrname": "outdoor_temperature"})
             self.config.attrs.append(attr)
         self.config.merge_attributes()
         for attr in self.config.attrs:
@@ -827,6 +872,85 @@ class HaierAC(HaierDevice):
         if self.preset_mode is None:
             self.preset_mode = PRESET_NONE
         return data
+
+    def _modifier_locks(self) -> tuple[dict[str, str], dict[str, set[str]]]:
+        """Read-only codes (code -> reason) and value whitelists right now.
+
+        The cloud ships "modifiers": rules that make attributes read-only while
+        the unit is off, cleaning, in a given mode or reporting an alarm. The
+        unit silently ignores such commands, so they are refused up front.
+        """
+        locked: dict[str, str] = {}
+        allowed: dict[str, set[str]] = {}
+        modifiers = (self.status_data or {}).get("modifiers") or []
+        for rule in sorted(
+            (r for r in modifiers if isinstance(r, dict)),
+            key=lambda r: r.get("priority") or 0,
+        ):
+            reason = self._modifier_reason(rule.get("trigger") or {})
+            if reason is None:
+                continue
+            for action in rule.get("actions") or []:
+                code = str(action.get("name"))
+                fields = str(action.get("rewriteFields") or "")
+                if "W" in fields and action.get("writable") is False:
+                    locked.setdefault(code, reason)
+                if "V" in fields:
+                    data = ((action.get("valueRange") or {}).get("list") or {}).get("data") or []
+                    if values := {_norm(i.get("data")) for i in data if isinstance(i, dict)}:
+                        allowed[code] = values
+        return locked, allowed
+
+    def _modifier_reason(self, trigger: dict) -> str | None:
+        """Why a rule fires ("off", "mode", "alarm"), or None if it does not."""
+        status_code = str(self.config["status"])
+        results = []
+        for cond in (trigger.get("conditions") or {}).get("condition") or []:
+            code = str(cond.get("mode"))
+            values = {_norm(v) for v in cond.get("values") or []}
+            matched = code in self._raw and _norm(self._raw[code]) in values
+            results.append((matched, "off" if code == status_code else "mode"))
+        if alarms := set(trigger.get("alarms") or []):
+            results.append((bool(alarms & set(self.alarms)), "alarm"))
+        if not results:
+            return None
+        if str(trigger.get("operator") or "AND").upper() == "OR":
+            return next((reason for matched, reason in results if matched), None)
+        if all(matched for matched, _ in results):
+            return results[0][1]
+        return None
+
+    def _check_writable(self, name: str, value: str | None = None) -> None:
+        attr = self.config.get_attr_by_name(name)
+        if attr is None:
+            return
+        code = str(attr.code)
+        locked, allowed = self._modifier_locks()
+        placeholders = {
+            "device": str(self.device_name),
+            "attribute": attr.description or name,
+        }
+        if code in locked:
+            raise HaierCommandLocked(
+                translation_domain=C.DOMAIN,
+                translation_key=f"locked_{locked[code]}",
+                translation_placeholders=placeholders,
+            )
+        if value is not None and code in allowed:
+            item = attr.get_item_code(str(value))
+            if item is not None and _norm(item) not in allowed[code]:
+                raise HaierCommandLocked(
+                    translation_domain=C.DOMAIN,
+                    translation_key="value_not_allowed",
+                    translation_placeholders={**placeholders, "value": str(value)},
+                )
+
+    async def _send_commands(self, commands: list[dict]) -> None:
+        await super()._send_commands(commands)
+        # Keep modifiers honest until the unit echoes the new state.
+        for command in commands:
+            if command.get("commandName") is not None:
+                self._raw[str(command["commandName"])] = str(command.get("value"))
 
     def _status_commands(self, value: str) -> list[dict]:
         if custom := self.config.get_command_by_name(f"status_{value}"):
@@ -897,7 +1021,8 @@ class HaierAC(HaierDevice):
         return self.config.get_values('swing_horizontal_mode')
 
     def get_swing_modes(self) -> list[str]:
-        return self.config.get_values('swing_mode')
+        # "special" (code 9) is "только для специальной модели" per the cloud.
+        return [m for m in self.config.get_values('swing_mode') if m != "special"]
 
     def get_preset_modes(self) -> list[str]:
         return ["none"] + self.config.get_preset_modes()
@@ -909,6 +1034,7 @@ class HaierAC(HaierDevice):
         code = self.config['target_temperature']
         if code is None:
             raise HomeAssistantError(f"{self.device_name}: target temperature is not supported")
+        self._check_writable("target_temperature")
         await self._send_commands([
             {
                 "commandName": code,
@@ -919,6 +1045,9 @@ class HaierAC(HaierDevice):
 
     async def switch_on(self, value: str = None) -> None:
         value = str(value or self.mode or HVACMode.AUTO)
+        if self.status:
+            # Turning on is never locked; a mode change on a running unit may be.
+            self._check_writable("mode", value)
         # Always send status=on: our idea of "already on" may be stale, and
         # then a mode change alone does not start the unit (MaxSezin fork).
         await self._send_commands([
@@ -935,71 +1064,86 @@ class HaierAC(HaierDevice):
         self.status = 0
 
     async def set_fan_mode(self, value: str) -> None:
+        self._check_writable("fan_mode", value)
         if commands := self.get_commands("fan_mode", value):
             await self._send_commands(commands)
             self.fan_mode = value
 
     async def set_swing_horizontal_mode(self, value: str) -> None:
+        self._check_writable("swing_horizontal_mode", value)
         if commands := self.get_commands("swing_horizontal_mode", value):
             await self._send_commands(commands)
             self.swing_horizontal_mode = value
 
     async def set_swing_mode(self, value: str) -> None:
+        self._check_writable("swing_mode", value)
         if commands := self.get_commands("swing_mode", value):
             await self._send_commands(commands)
             self.swing_mode = value
 
     async def set_preset_mode(self, value: str) -> None:
+        if value != PRESET_NONE:
+            self._check_writable(f"preset_mode_{value}")
         if commands := self.get_commands("preset_mode", value):
             await self._send_commands(commands)
             self.preset_mode = value
 
     async def set_light_on(self, value: bool) -> None:
+        self._check_writable("light")
         if commands := self.get_commands("light", value):
             await self._send_commands(commands)
             self.light_on = value
 
     async def set_sound_on(self, value: bool) -> None:
+        self._check_writable("sound")
         if commands := self.get_commands("sound", value):
             await self._send_commands(commands)
             self.sound_on = value
 
     async def set_quiet_on(self, value: bool) -> None:
+        self._check_writable("quiet")
         if commands := self.get_commands("quiet", value):
             await self._send_commands(commands)
             self.quiet_on = value
 
     async def set_health_on(self, value: bool) -> None:
+        self._check_writable("health")
         if commands := self.get_commands("health", value):
             await self._send_commands(commands)
             self.health_on = value
 
     async def set_turbo_on(self, value: bool) -> None:
+        self._check_writable("turbo")
         if commands := self.get_commands("turbo", value):
             await self._send_commands(commands)
             self.turbo_on = value
 
     async def set_comfort_on(self, value: bool) -> None:
+        self._check_writable("comfort")
         if commands := self.get_commands("comfort", value):
             await self._send_commands(commands)
             self.comfort_on = value
 
     async def set_cleaning_on(self, value: bool) -> None:
+        self._check_writable("cleaning")
         if commands := self.get_commands("cleaning", value):
             await self._send_commands(commands)
             self.cleaning_on = value
 
     async def set_antifreeze_on(self, value: bool) -> None:
+        self._check_writable("antifreeze")
         if commands := self.get_commands("antifreeze", value):
             await self._send_commands(commands)
             self.antifreeze_on = value
 
     async def set_autohumidity_on(self, value: bool) -> None:
+        self._check_writable("autohumidity")
         if commands := self.get_commands("autohumidity", value):
             await self._send_commands(commands)
             self.autohumidity_on = value
 
     async def set_eco_sensor(self, value: str) -> None:
+        self._check_writable("eco_sensor", value)
         if commands := self.get_commands("eco_sensor", value):
             await self._send_commands(commands)
             self.eco_sensor = value
@@ -1037,6 +1181,17 @@ class HaierAC(HaierDevice):
         if self.config['eco_sensor'] is not None:
             entities.append(select.HaierACEcoSensorSelect(self))
         return entities
+
+    def create_entities_sensor(self) -> list:
+        from . import sensor
+        entities = []
+        if self.config['outdoor_temperature'] is not None:
+            entities.append(sensor.HaierACOutdoorTemperatureSensor(self))
+        return entities
+
+    def create_entities_binary_sensor(self) -> list:
+        from . import binary_sensor
+        return [binary_sensor.HaierACProblemSensor(self)]
 
 
 class HaierREF(HaierDevice):
@@ -1310,6 +1465,12 @@ def parsebool(value) -> bool:
     if value in ("on", 1, True, "true", "enable", "1"):
         return True
     return False
+
+
+def _norm(value: Any) -> str:
+    """Compare raw values: modifiers say "true", the unit reports "1"."""
+    text = str(value).strip().lower()
+    return {"true": "1", "on": "1", "false": "0", "off": "0"}.get(text, text)
 
 
 def parsefloat(value, default: float | None = None) -> float | None:

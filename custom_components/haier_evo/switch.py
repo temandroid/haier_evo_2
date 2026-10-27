@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from homeassistant.components.switch import SwitchEntity
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 
 from . import api
@@ -53,6 +54,7 @@ class HaierSwitch(SwitchEntity):
 
 class HaierACLightSwitch(HaierSwitch):
     _attr_icon = "mdi:lightbulb"
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
@@ -62,6 +64,7 @@ class HaierACLightSwitch(HaierSwitch):
 
 
 class HaierACSoundSwitch(HaierSwitch):
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
@@ -71,6 +74,8 @@ class HaierACSoundSwitch(HaierSwitch):
 
 
 class HaierACQuietSwitch(HaierSwitch):
+    # Duplicates the climate preset "sleep" (same code); kept for automations.
+    _attr_entity_registry_enabled_default = False
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
@@ -80,6 +85,8 @@ class HaierACQuietSwitch(HaierSwitch):
 
 
 class HaierACTurboSwitch(HaierSwitch):
+    # Duplicates the climate preset "boost" (same code); kept for automations.
+    _attr_entity_registry_enabled_default = False
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
@@ -107,6 +114,7 @@ class HaierACComfortSwitch(HaierSwitch):
 
 
 class HaierACCleaningSwitch(HaierSwitch):
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
@@ -116,6 +124,7 @@ class HaierACCleaningSwitch(HaierSwitch):
 
 
 class HaierACAntiFreezeSwitch(HaierSwitch):
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
@@ -125,6 +134,7 @@ class HaierACAntiFreezeSwitch(HaierSwitch):
 
 
 class HaierACAutoHumiditySwitch(HaierSwitch):
+    _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)

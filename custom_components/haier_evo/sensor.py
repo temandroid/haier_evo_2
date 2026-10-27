@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
 from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant
 
@@ -112,3 +116,18 @@ class HaierWMStatusSensor(HaierSensor):
     def native_value(self) -> str | None:
         value = getattr(self._device, self._device_attr_name, None)
         return None if value is None else str(value)
+
+
+class HaierACOutdoorTemperatureSensor(HaierSensor):
+    """Code 38: the cloud calls it "room temperature" too, but it follows the outdoor unit."""
+
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_icon = "mdi:home-thermometer-outline"
+
+    def __init__(self, device: api.HaierAC):
+        super().__init__(device)
+        self._device_attr_name = "outdoor_temperature"
+        self._attr_unique_id = f"{device.device_id}_{device.device_model}_outdoor_temperature"
+        self._attr_name = f"{device.device_name} Температура наружного блока"

@@ -97,6 +97,18 @@
     "exceptions": {
         "command_failed": {
             "message": "Haier Evo: нет связи с облаком, команда не отправлена"
+        },
+        "locked_off": {
+            "message": "{device} выключен: «{attribute}» нельзя изменить, пока он не включён"
+        },
+        "locked_mode": {
+            "message": "{device}: «{attribute}» в текущем режиме изменить нельзя"
+        },
+        "locked_alarm": {
+            "message": "{device} сообщает об ошибке: «{attribute}» изменить нельзя"
+        },
+        "value_not_allowed": {
+            "message": "{device}: значение {value} для «{attribute}» в текущем режиме недоступно"
         }
     }
 }

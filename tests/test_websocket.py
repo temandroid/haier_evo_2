@@ -267,12 +267,11 @@ async def test_command_error_is_logged(hass, setup_entry, ws_factory, caplog):
 
 async def test_quiet_and_turbo_follow_the_unit(hass, setup_entry, ws_factory):
     """Upstream #67: the "Тихий" switch never followed the unit."""
-    registry = er.async_get(hass)
-    quiet = registry.async_get_entity_id("switch", C.DOMAIN, f"{CLIMATE_UID}_quiet")
-    assert hass.states.get(quiet).state == "off"
+    device = setup_entry.runtime_data.devices[0]
+    assert device.quiet_on is False
     ws_factory.current.feed(status_message({"20": "1"}))
     await hass.async_block_till_done()
-    assert hass.states.get(quiet).state == "on"
+    assert device.quiet_on is True
     assert hass.states.get(climate_id(hass)).attributes["preset_mode"] == "sleep"
 
 
