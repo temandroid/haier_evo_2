@@ -23,10 +23,10 @@ from homeassistant.components.climate.const import (
     ClimateEntityFeature,
     HVACMode,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 
 from . import config as CFG  # noqa: N812
 from . import const as C  # noqa: N812
@@ -121,6 +121,7 @@ class Haier:
         self._ever_connected = False
         self._disconnected_since: float | None = self._now()
         self._pending: dict[str, dict] = {}  # trace -> command waiting for command_response
+        self._unavailable_timer: CALLBACK_TYPE | None = None
         self.reconnects = 0
         self.lost_commands = 0
 
@@ -199,8 +200,16 @@ class Haier:
             name=f"{C.DOMAIN} refresh", cancel_on_shutdown=True,
         ))
 
+    def _create_task(self, coro: Any, name: str) -> None:
+        # Entry background tasks are cancelled on unload.
+        if self._entry is not None:
+            self._entry.async_create_background_task(self.hass, coro, f"{C.DOMAIN} {name}")
+        else:
+            self.hass.async_create_task(coro, eager_start=False)
+
     async def async_stop(self) -> None:
         self._stopping = True
+        self._cancel_unavailable_timer()
         self._wakeup.set()
         ws = self._ws
         if ws is not None and not ws.closed:
@@ -218,6 +227,22 @@ class Haier:
         if self._disconnected_since is None:
             self._disconnected_since = self._now()
         self._notify_all()
+        # cloud_available is only evaluated when an entity writes its state:
+        # without this nudge nothing would turn the entities unavailable.
+        if self._unavailable_timer is None and not self._stopping:
+            self._unavailable_timer = async_call_later(
+                self.hass, C.WS_UNAVAILABLE_AFTER + 1, self._on_unavailable
+            )
+
+    @callback
+    def _on_unavailable(self, _now: Any) -> None:
+        self._unavailable_timer = None
+        self._notify_all()
+
+    def _cancel_unavailable_timer(self) -> None:
+        if self._unavailable_timer is not None:
+            self._unavailable_timer()
+            self._unavailable_timer = None
 
     def _notify_all(self) -> None:
         for device in self.devices:
@@ -274,12 +299,13 @@ class Haier:
         outage = None if self._disconnected_since is None else self._now() - self._disconnected_since
         self._ws = ws
         self._disconnected_since = None
+        self._cancel_unavailable_timer()
         self._connected.set()
         if self._ever_connected:
             self.reconnects += 1
         _LOGGER.debug("WebSocket connected")
         if self._ever_connected and outage is not None and outage > C.WS_RESYNC_AFTER:
-            self.hass.async_create_task(self._async_resync(), eager_start=False)
+            self._create_task(self._async_resync(), "resync")
         self._ever_connected = True
         self._notify_all()
         try:
@@ -302,10 +328,15 @@ class Haier:
     async def _async_resync(self, devices: list[HaierDevice] | None = None) -> None:
         """Re-read device statuses via REST (after an outage, a lost command, or periodically)."""
         for device in devices if devices is not None else self.devices:
+            started = self._now()
             try:
                 status = await self.client.async_get_device_status(device.device_id)
             except HaierError as err:
                 _LOGGER.debug("Resync of %s failed: %s", device.device_name, err)
+                continue
+            if device.changed_at > started:
+                # A push or a command came in while the request was in flight:
+                # the REST snapshot is older than what the entity already shows.
                 continue
             device.update_from_backend(status)
             device.notify()
@@ -319,13 +350,13 @@ class Haier:
         if not isinstance(message, dict):
             return
         _LOGGER.debug("Received WSS message: %s", message)
-        if message.get("event") == "command_response":
-            self._handle_ack(message)
-        device = self.get_device_by_id(message.get("macAddress") or "")
-        if device is None:
-            _LOGGER.debug("Message for an unknown device: %s", message.get("event"))
-            return
         try:
+            if message.get("event") == "command_response":
+                self._handle_ack(message)
+            device = self.get_device_by_id(message.get("macAddress") or "")
+            if device is None:
+                _LOGGER.debug("Message for an unknown device: %s", message.get("event"))
+                return
             device.on_message(message)
         except Exception:  # noqa: BLE001 - one bad message must not kill the socket
             _LOGGER.exception("Failed to handle %s message", message.get("event"))
@@ -333,9 +364,11 @@ class Haier:
     def _handle_ack(self, message: dict) -> None:
         payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
         trace = message.get("trace") or payload.get("trace")
+        trace = trace if isinstance(trace, str) else None
         err = message.get("errNo", payload.get("errNo"))
+        command = None
         if trace in self._pending:
-            del self._pending[trace]
+            command = self._pending.pop(trace)
         elif trace:
             # The cloud also echoes responses to commands from the Evo app or
             # Alice. Counting one for our pending command would hide a lost one.
@@ -344,23 +377,20 @@ class Haier:
         else:
             # No trace in the answer: count it for the oldest command to that unit.
             mac = str(message.get("macAddress") or "").lower()
-            for pending_trace, command in self._pending.items():
-                if str(command.get("macAddress") or "").lower() == mac:
-                    del self._pending[pending_trace]
+            for pending_trace, pending in self._pending.items():
+                if str(pending.get("macAddress") or "").lower() == mac:
+                    command = self._pending.pop(pending_trace)
                     break
         if err not in (None, 0, "0"):
             _LOGGER.warning("Haier Evo rejected a command, errNo=%s", err)
+            # The entity already shows the requested value: read the real one back.
+            mac = message.get("macAddress") or (command or {}).get("macAddress") or ""
+            if (device := self.get_device_by_id(mac)) is not None:
+                self._create_task(self._async_resync([device]), "resync")
 
-    def _watch_ack(self, payload: dict) -> None:
-        trace = payload.get("trace")
-        if not trace or self._entry is None:
-            return
-        self._pending[trace] = payload
-        self._entry.async_create_background_task(
-            self.hass, self._async_ack_watchdog(trace, payload), f"{C.DOMAIN} ack"
-        )
-
-    async def _async_ack_watchdog(self, trace: str, payload: dict) -> None:
+    async def _async_ack_watchdog(
+        self, trace: str, payload: dict, sent_ws: ClientWebSocketResponse
+    ) -> None:
         """No command_response in time: re-send once on a fresh connection.
 
         Catches the session that accepts writes but no longer delivers them,
@@ -371,10 +401,11 @@ class Haier:
         if trace not in self._pending:
             return
         _LOGGER.warning("Haier Evo did not confirm a command in %s s, re-sending it", C.WS_ACK_TIMEOUT)
-        ws = self._ws
-        if ws is not None and not ws.closed:
+        # Only the socket the command went out on is suspect: commands sent
+        # together must not tear down the fresh connection one after another.
+        if sent_ws is self._ws and not sent_ws.closed:
             self._connected.clear()
-            await ws.close()
+            await sent_ws.close()
         try:
             await self.async_send(payload, retry=True)
         except HomeAssistantError:
@@ -412,21 +443,27 @@ class Haier:
         call fails loudly instead of pretending it worked.
         """
         data = json.dumps(payload)
+        trace = payload.get("trace") if not retry and self._entry is not None else None
         for _attempt in range(2):
             ws = await self._async_wait_connected(C.WS_SEND_TIMEOUT)
             if ws is None:
                 break
+            if trace:
+                # Registered before the write: the answer may beat send_str.
+                self._pending[trace] = payload
             try:
                 await ws.send_str(data)
             except (ClientError, ConnectionError, RuntimeError) as err:
                 _LOGGER.warning("Sending failed (%s), reconnecting", type(err).__name__)
+                if trace:
+                    self._pending.pop(trace, None)
                 self._connected.clear()
                 with suppress(Exception):
                     await ws.close()
                 continue
             _LOGGER.debug("Sent message: %s", data)
-            if not retry:
-                self._watch_ack(payload)
+            if trace:
+                self._create_task(self._async_ack_watchdog(trace, payload, ws), "ack")
             return
         raise HaierCommandError(translation_domain=C.DOMAIN, translation_key="command_failed")
 
@@ -452,6 +489,8 @@ class HaierDevice:
         self._config = None
         self._status_data = backend_data
         self.alarms: list[str] = []
+        # Last push or command (monotonic): a REST snapshot older than this is stale.
+        self.changed_at = 0.0
 
     def __repr__(self) -> str:
         return (
@@ -575,14 +614,20 @@ class HaierDevice:
 
     def _handle_status_update(self, received_message: dict) -> None:
         statuses = (received_message.get("payload") or {}).get("statuses") or []
-        for status in statuses:
-            properties = (status or {}).get("properties") or {}
-            for key, value in properties.items():
-                self._set_attribute_value(key, value)
-            if isinstance(status, dict) and "alarms" in status:
-                self._set_alarms(status["alarms"])
-        self.available = True
-        self.notify()
+        self.changed_at = time.monotonic()
+        try:
+            for status in statuses:
+                if not isinstance(status, dict):
+                    continue
+                properties = status.get("properties")
+                for key, value in (properties if isinstance(properties, dict) else {}).items():
+                    self._set_attribute_value(key, value)
+                if "alarms" in status:
+                    self._set_alarms(status["alarms"])
+            self.available = True
+        finally:
+            # Whatever was applied before a malformed entry still reaches the UI.
+            self.notify()
 
     def _handle_device_status_update(self, received_message: dict) -> None:
         status = (received_message.get("payload") or {}).get("status")
@@ -596,6 +641,7 @@ class HaierDevice:
 
     async def _send_message(self, message: dict) -> None:
         await self._haier.async_send(message)
+        self.changed_at = time.monotonic()
 
     async def _send_commands(self, commands: list[dict]) -> None:
         await self._send_group_command(commands)
@@ -744,6 +790,8 @@ class HaierAC(HaierDevice):
         # Raw attribute values by code, as the cloud sends them: modifiers are
         # written against these, not against our parsed state.
         self._raw: dict[str, str] = {}
+        # Set on an off unit: the cloud refuses it until the unit runs.
+        self._deferred_temperature: float | None = None
         self._get_status(backend_data)
 
     @property
@@ -887,6 +935,10 @@ class HaierAC(HaierDevice):
         """
         locked: dict[str, str] = {}
         allowed: dict[str, set[str]] = {}
+        # Rules go by priority, and the first firing rule that rewrites a field
+        # decides it, "writable": true included (live units use priority 0 for
+        # the "unit is off" rule, which has to win).
+        decided: set[str] = set()
         modifiers = (self.status_data or {}).get("modifiers") or []
         for rule in sorted(
             (r for r in modifiers if isinstance(r, dict)),
@@ -898,9 +950,11 @@ class HaierAC(HaierDevice):
             for action in rule.get("actions") or []:
                 code = str(action.get("name"))
                 fields = str(action.get("rewriteFields") or "")
-                if "W" in fields and action.get("writable") is False:
-                    locked.setdefault(code, reason)
-                if "V" in fields:
+                if "W" in fields and code not in decided:
+                    decided.add(code)
+                    if action.get("writable") is False:
+                        locked[code] = reason
+                if "V" in fields and code not in allowed:
                     data = ((action.get("valueRange") or {}).get("list") or {}).get("data") or []
                     if values := {_norm(i.get("data")) for i in data if isinstance(i, dict)}:
                         allowed[code] = values
@@ -1039,18 +1093,28 @@ class HaierAC(HaierDevice):
         code = self.config['target_temperature']
         if code is None:
             raise HomeAssistantError(f"{self.device_name}: target temperature is not supported")
-        self._check_writable("target_temperature")
+        try:
+            self._check_writable("target_temperature")
+        except HaierCommandLocked as err:
+            if err.translation_key != "locked_off":
+                raise
+            # Alice and thermostat cards set the temperature of an off unit
+            # ("включи на 24" may come temperature first). Keep it for switch_on.
+            self._deferred_temperature = float(value)
+            self.target_temperature = float(value)
+            return
         await self._send_commands([
             {
                 "commandName": code,
                 "value": format_number(value),
             }
         ])
+        self._deferred_temperature = None
         self.target_temperature = float(value)
 
     async def switch_on(self, value: str = None) -> None:
         value = str(value or self.mode or HVACMode.AUTO)
-        if self.status:
+        if self.status and value != self.mode:
             # Turning on is never locked; a mode change on a running unit may be.
             self._check_writable("mode", value)
         # Always send status=on: our idea of "already on" may be stale, and
@@ -1061,6 +1125,13 @@ class HaierAC(HaierDevice):
         ])
         self.status = 1
         self.mode = value
+        if (deferred := self._deferred_temperature) is not None:
+            self._deferred_temperature = None
+            try:
+                await self.set_temperature(deferred)
+            except HaierCommandLocked as err:
+                # The new mode does not take a setpoint (e.g. fan only).
+                _LOGGER.debug("Dropping the deferred temperature: %s", err.translation_key)
 
     async def switch_off(self) -> None:
         await self._send_commands([
@@ -1092,6 +1163,10 @@ class HaierAC(HaierDevice):
         if commands := self.get_commands("preset_mode", value):
             await self._send_commands(commands)
             self.preset_mode = value
+            if value in (PRESET_NONE, "sleep", "boost"):
+                # The getter reads these two until the unit echoes them.
+                self.quiet_on = value == "sleep"
+                self.turbo_on = value == "boost"
 
     async def set_light_on(self, value: bool) -> None:
         self._check_writable("light")

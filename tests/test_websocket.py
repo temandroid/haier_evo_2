@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
@@ -240,6 +241,64 @@ async def test_unconfirmed_command_is_resent_once(hass, setup_entry, ws_factory,
         await hass.async_block_till_done()
     assert haier.lost_commands == 0
     assert "did not confirm a command in" in caplog.text
+
+
+async def test_two_unconfirmed_commands_reconnect_once(hass, setup_entry, ws_factory):
+    """The second watchdog must not tear down the socket the first one just opened."""
+    haier: Haier = setup_entry.runtime_data
+    first = ws_factory.current
+    with patch.object(C, "WS_ACK_TIMEOUT", 0.1):
+        for temp in (25, 26):
+            await hass.services.async_call(
+                "climate", "set_temperature", {"entity_id": climate_id(hass), "temperature": temp}, blocking=True
+            )
+        traces = [m["trace"] for m in first.sent[-2:]]
+        second = await ws_factory.wait_for(2)
+        async with asyncio.timeout(2):
+            while len(second.sent) < 2:
+                await asyncio.sleep(0.01)
+        for trace in traces:
+            second.feed({"event": "command_response", "macAddress": MAC_1, "trace": trace})
+        await asyncio.sleep(0.3)
+        await hass.async_block_till_done()
+    assert len(ws_factory.sockets) == 2
+    assert not second.closed
+    assert haier.lost_commands == 0
+
+
+async def test_rejected_command_reads_state_back(hass, setup_entry, ws_factory, aioclient_mock):
+    ws = ws_factory.current
+    before = sum(1 for c in aioclient_mock.mock_calls if status_url(MAC_1) in str(c[1]))
+    await hass.services.async_call(
+        "climate", "set_temperature", {"entity_id": climate_id(hass), "temperature": 29}, blocking=True
+    )
+    ws.feed({"event": "command_response", "macAddress": MAC_1, "trace": ws.sent[-1]["trace"], "errNo": 5})
+    await asyncio.sleep(0.05)
+    await hass.async_block_till_done()
+    after = sum(1 for c in aioclient_mock.mock_calls if status_url(MAC_1) in str(c[1]))
+    assert after == before + 1
+    assert hass.states.get(climate_id(hass)).attributes["temperature"] == 24
+
+
+async def test_unavailable_without_any_new_event(hass, setup_entry, ws_factory):
+    """After a credentials failure the loop stops: a timer still has to flip the entities."""
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    from custom_components.haier_evo.client import HaierAuthError
+
+    haier: Haier = setup_entry.runtime_data
+    now = haier._now()
+    with patch.object(haier.client, "async_get_token", side_effect=HaierAuthError("nope")):
+        ws_factory.current.server_close()
+        await asyncio.sleep(0.05)
+        await hass.async_block_till_done()
+        assert haier._task.done()
+    assert hass.states.get(climate_id(hass)).state == "cool"
+    with patch.object(Haier, "_now", return_value=now + C.WS_UNAVAILABLE_AFTER + 2):
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=C.WS_UNAVAILABLE_AFTER + 2))
+        await hass.async_block_till_done()
+        assert hass.states.get(climate_id(hass)).state == "unavailable"
 
 
 async def test_lost_command_reads_state_back(hass, setup_entry, ws_factory, aioclient_mock):

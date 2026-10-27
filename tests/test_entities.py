@@ -60,25 +60,51 @@ async def test_special_swing_mode_hidden(hass, setup_entry):
     assert "special" not in modes
 
 
-async def test_temperature_locked_while_off(hass, setup_entry, ws_factory):
+async def test_temperature_of_an_off_unit_is_sent_on_turn_on(hass, setup_entry, ws_factory):
+    """Alice may set the temperature before turning the unit on ("включи на 23")."""
     ws = ws_factory.current
     ws.feed(status_message({"21": "0"}))
     await hass.async_block_till_done()
     ws.sent.clear()
-    with pytest.raises(HomeAssistantError) as err:
-        await hass.services.async_call(
-            "climate", "set_temperature", {"entity_id": climate_id(hass), "temperature": 23}, blocking=True
-        )
-    assert err.value.translation_key == "locked_off"
-    assert ws.sent == []
-    # turning on is never locked, and afterwards the temperature goes through
-    await hass.services.async_call(
-        "climate", "set_hvac_mode", {"entity_id": climate_id(hass), "hvac_mode": "cool"}, blocking=True
-    )
     await hass.services.async_call(
         "climate", "set_temperature", {"entity_id": climate_id(hass), "temperature": 23}, blocking=True
     )
+    # the cloud locks the setpoint of an off unit: nothing goes out yet
+    assert ws.sent == []
+    assert hass.states.get(climate_id(hass)).attributes["temperature"] == 23
+    await hass.services.async_call(
+        "climate", "set_hvac_mode", {"entity_id": climate_id(hass), "hvac_mode": "cool"}, blocking=True
+    )
+    assert {"commandName": "21", "value": "1"} in ws.sent[0]["commands"]
     assert ws.sent[-1]["commands"] == [{"commandName": "0", "value": "23"}]
+
+
+async def test_turn_off_with_temperature_does_not_fail(hass, setup_entry, ws_factory):
+    await hass.services.async_call(
+        "climate", "set_temperature",
+        {"entity_id": climate_id(hass), "temperature": 21, "hvac_mode": "off"}, blocking=True,
+    )
+    assert hass.states.get(climate_id(hass)).state == "off"
+
+
+async def test_preset_shows_up_before_the_echo(hass, setup_entry, ws_factory):
+    device = setup_entry.runtime_data.devices[0]
+    await device.set_preset_mode("sleep")
+    assert device.preset_mode == "sleep"
+    await device.set_preset_mode("none")
+    assert device.preset_mode == "none"
+
+
+async def test_turn_on_running_unit_with_alarm(hass, setup_entry, ws_factory):
+    """An alarm locks the mode, but turn_on without a mode change is not a change."""
+    ws = ws_factory.current
+    ws.feed({
+        "event": "status",
+        "macAddress": setup_entry.runtime_data.devices[0].device_mac,
+        "payload": {"statuses": [{"properties": {}, "alarms": ["outdoorFanErr"]}]},
+    })
+    await hass.async_block_till_done()
+    await hass.services.async_call("climate", "turn_on", {"entity_id": climate_id(hass)}, blocking=True)
 
 
 async def test_our_own_turn_off_locks_without_echo(hass, setup_entry, ws_factory):

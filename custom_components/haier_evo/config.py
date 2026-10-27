@@ -356,9 +356,16 @@ class Attribute(dict):
         if not items:
             return str(code) if code is not None else default
         item = next((i for i in items if str(i.value) == str(code)), None)
+        if item is None:
+            # Lists say "1"/"0" where some messages say "true"/"false".
+            norm = _BOOL_NAMES.get(str(code).strip().lower())
+            item = next((i for i in items if norm is not None and str(i.value) == norm), None)
         if item is None or item.name in (None, "unknown"):
             return default
         return str(item.name)
+
+
+_BOOL_NAMES = {"true": "1", "on": "1", "false": "0", "off": "0"}
 
 
 class Range(dict):
@@ -513,7 +520,8 @@ class EcoSensor(Item):
 
 class Temperature(Item):
     # Own dict: setdefault() below used to grow the shared Item.mappings.
-    mappings: dict[str, str] = {}
+    # The two shared names stay: fridge zones list "Выключен" among temperatures.
+    mappings: dict[str, str] = {"Выключен": "off", "Активен": "on"}
 
     def __init__(self, data: dict) -> None:
         description = (data.get("name") or "").strip()
