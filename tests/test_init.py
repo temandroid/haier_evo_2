@@ -97,10 +97,28 @@ async def test_unload(hass: HomeAssistant, setup_entry, ws_factory):
 
 
 async def test_diagnostics_are_redacted(hass: HomeAssistant, setup_entry):
+    # Real status payloads carry the MAC in free-form strings and presigned icon URLs.
+    device = setup_entry.runtime_data.devices[0]
+    device._status_data = {
+        **(device.status_data or {}),
+        "scenarios": {"default": {
+            "title": "Сценарии",
+            "deeplink": f"haierevo://hiHome/device/scenario?macAddress={MAC_1}",
+            "icon": "https://storage.example/icon.png?X-Amz-Credential=TESTKEY&X-Amz-Signature=abc",
+        }},
+        "note": f"encoded {MAC_2.replace(':', '%3A').upper()}",
+    }
     diag = await async_get_config_entry_diagnostics(hass, setup_entry)
     text = json.dumps(diag, ensure_ascii=False)
-    for secret in (PASSWORD, EMAIL, MAC_1, MAC_2, "TESTSERIAL0001", "test-access-token"):
+    for secret in (
+        PASSWORD, EMAIL, MAC_1, MAC_2, MAC_2.replace(":", "%3A").upper(),
+        "TESTSERIAL0001", "test-access-token", "TESTKEY",
+    ):
         assert secret not in text
+    assert diag["entry"]["title"] == "**REDACTED**"
+    scenario = diag["haier"]["devices"][0]["backend_data"]["scenarios"]["default"]
+    assert scenario["title"] == "Сценарии"
+    assert scenario["icon"] == "https://storage.example/icon.png"
     assert diag["haier"]["devices"][0]["device_model"] == "AS25PHP3HRA"
 
 
