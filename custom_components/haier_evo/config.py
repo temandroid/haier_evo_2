@@ -1,12 +1,14 @@
 from __future__ import annotations
-import shutil
+
 from os.path import dirname, exists, join
+
 from homeassistant.util.yaml import load_yaml
-from .logger import _LOGGER
+
 from . import devices as config_dir
+from .logger import _LOGGER
 
 
-class HaierDeviceConfig(object):
+class HaierDeviceConfig:
 
     def __init__(self, model: str, userpath: str = "") -> None:
         self._model = model
@@ -34,20 +36,18 @@ class HaierDeviceConfig(object):
         fname = join(_CONFIG_DIR, self._model) + '.yaml'
         if not exists(fname):
             fname = join(_CONFIG_DIR, 'default') + '.yaml'
+        # A user override (/config/haier_evo.<MODEL>.yaml) still wins, but it is
+        # no longer created automatically: the copy froze the bundled profile
+        # forever, so fixes in new releases never reached the user.
         userfname = f"{self._userpath}.{self._model}.yaml"
-        if not exists(userfname):
-            try:
-                shutil.copy(fname, userfname)
-            except Exception:
-                pass
-        return userfname if exists(userfname) else fname
+        return userfname if self._userpath and exists(userfname) else fname
 
     def _load_config_file(self) -> None:
         fname = self._find_config_file()
         try:
             self._config = load_yaml(fname) or {}
         except Exception as e:
-            _LOGGER.error(f"Failed to load config: {e}")
+            _LOGGER.error("Failed to load config %s: %s", fname, e)
             self._config = {}
         else:
             _LOGGER.debug("Loaded device config %s", fname)
@@ -63,6 +63,9 @@ class HaierDeviceConfig(object):
             lambda a: str(a.code) == str(code),
             self.attrs
         ), None)
+
+    def get_attrs_by_code(self, code: str | int) -> list[Attribute]:
+        return [a for a in self.attrs if str(a.code) == str(code)]
 
     def get_attr_by_name(self, name: str) -> Attribute | None:
         if name in self._attrs_cache:
@@ -161,7 +164,7 @@ class HaierACConfig(HaierDeviceConfig):
             modes = self._config.get('preset_modes')
             assert isinstance(modes, list)
             assert len(modes) > 0
-            assert all(((m and isinstance(m, str)) for m in modes))
+            assert all((m and isinstance(m, str)) for m in modes)
             return modes
         except AssertionError:
             return []
@@ -285,7 +288,7 @@ class Attribute(dict):
             "description": self.description,
             "current": self.current,
             "range": _range.to_dict() if _range else None,
-            "list": [l.to_dict() for l in self.list],
+            "list": [item.to_dict() for item in self.list],
         }
 
     @property
@@ -337,17 +340,25 @@ class Attribute(dict):
     def range(self, value: dict) -> None:
         self["range"] = value
 
-    def get_item_code(self, name: str, default=None) -> str:
-        return str(getattr(next(filter(
-            lambda i: str(i.name) == name,
-            self.list
-        ), None), "value", default))
+    def get_item_code(self, name: str, default: str | None = None) -> str | None:
+        item = next((i for i in self.list if str(i.name) == str(name)), None)
+        if item is None or item.value is None:
+            return default
+        return str(item.value)
 
-    def get_item_name(self, code: str, default=None) -> str:
-        return str(getattr(next(filter(
-            lambda i: str(i.value) == code,
-            self.list
-        ), None), "name", default))
+    def get_item_name(self, code: str, default: str | None = None) -> str | None:
+        """Name for a raw value; None for an unknown one.
+
+        It used to return the string "None", which ended up in HA as
+        `'None' is not a valid HVACMode` (upstream #61, #73).
+        """
+        items = self.list
+        if not items:
+            return str(code) if code is not None else default
+        item = next((i for i in items if str(i.value) == str(code)), None)
+        if item is None or item.name in (None, "unknown"):
+            return default
+        return str(item.name)
 
 
 class Range(dict):
@@ -501,6 +512,9 @@ class EcoSensor(Item):
 
 
 class Temperature(Item):
+    # Own dict: setdefault() below used to grow the shared Item.mappings.
+    mappings: dict[str, str] = {}
+
     def __init__(self, data: dict) -> None:
         description = (data.get("name") or "").strip()
         self.mappings.setdefault(
