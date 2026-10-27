@@ -265,6 +265,24 @@ async def test_command_error_is_logged(hass, setup_entry, ws_factory, caplog):
     assert "errNo=-1" in caplog.text
 
 
+async def test_foreign_command_response_is_not_our_ack(hass, setup_entry, ws_factory, caplog):
+    """The cloud echoes responses to app/Alice commands; they must not confirm ours."""
+    haier: Haier = setup_entry.runtime_data
+    ws = ws_factory.current
+    with patch.object(C, "WS_ACK_TIMEOUT", 1):
+        await hass.services.async_call(
+            "climate", "set_temperature", {"entity_id": climate_id(hass), "temperature": 22}, blocking=True
+        )
+        trace = ws.sent[-1]["trace"]
+        ws.feed({"event": "command_response", "macAddress": MAC_1, "trace": "from-the-app", "errNo": -1})
+        await hass.async_block_till_done()
+        assert trace in haier._pending
+        assert "rejected a command" not in caplog.text
+        ws.feed({"event": "command_response", "macAddress": MAC_1, "trace": trace, "errNo": 0})
+        await hass.async_block_till_done()
+    assert haier._pending == {}
+
+
 async def test_quiet_and_turbo_follow_the_unit(hass, setup_entry, ws_factory):
     """Upstream #67: the "Тихий" switch never followed the unit."""
     device = setup_entry.runtime_data.devices[0]

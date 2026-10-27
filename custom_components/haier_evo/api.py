@@ -333,16 +333,21 @@ class Haier:
     def _handle_ack(self, message: dict) -> None:
         payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
         trace = message.get("trace") or payload.get("trace")
+        err = message.get("errNo", payload.get("errNo"))
         if trace in self._pending:
             del self._pending[trace]
+        elif trace:
+            # The cloud also echoes responses to commands from the Evo app or
+            # Alice. Counting one for our pending command would hide a lost one.
+            _LOGGER.debug("command_response for a foreign command, errNo=%s", err)
+            return
         else:
-            # No known trace in the answer: count it for the oldest command to that unit.
+            # No trace in the answer: count it for the oldest command to that unit.
             mac = str(message.get("macAddress") or "").lower()
             for pending_trace, command in self._pending.items():
                 if str(command.get("macAddress") or "").lower() == mac:
                     del self._pending[pending_trace]
                     break
-        err = message.get("errNo", payload.get("errNo"))
         if err not in (None, 0, "0"):
             _LOGGER.warning("Haier Evo rejected a command, errNo=%s", err)
 
