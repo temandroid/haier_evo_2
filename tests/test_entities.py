@@ -79,6 +79,21 @@ async def test_temperature_of_an_off_unit_is_sent_on_turn_on(hass, setup_entry, 
     assert ws.sent[-1]["commands"] == [{"commandName": "0", "value": "23"}]
 
 
+async def test_stale_deferred_temperature_is_dropped(hass, setup_entry, ws_factory):
+    """Turned on with the remote meanwhile: a later turn_on must not resend 23."""
+    ws = ws_factory.current
+    ws.feed(status_message({"21": "0"}))
+    await hass.async_block_till_done()
+    await hass.services.async_call(
+        "climate", "set_temperature", {"entity_id": climate_id(hass), "temperature": 23}, blocking=True
+    )
+    ws.feed(status_message({"21": "1"}))
+    await hass.async_block_till_done()
+    ws.sent.clear()
+    await hass.services.async_call("climate", "turn_on", {"entity_id": climate_id(hass)}, blocking=True)
+    assert all(c["commandName"] != "0" for m in ws.sent for c in m["commands"])
+
+
 async def test_turn_off_with_temperature_does_not_fail(hass, setup_entry, ws_factory):
     await hass.services.async_call(
         "climate", "set_temperature",

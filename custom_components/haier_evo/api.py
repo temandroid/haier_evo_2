@@ -334,9 +334,11 @@ class Haier:
             except HaierError as err:
                 _LOGGER.debug("Resync of %s failed: %s", device.device_name, err)
                 continue
-            if device.changed_at > started:
+            if devices is None and device.changed_at > started:
                 # A push or a command came in while the request was in flight:
                 # the REST snapshot is older than what the entity already shows.
+                # A targeted resync (lost or rejected command) applies anyway:
+                # it exists to undo an optimistic value.
                 continue
             device.update_from_backend(status)
             device.notify()
@@ -461,6 +463,11 @@ class Haier:
                 with suppress(Exception):
                     await ws.close()
                 continue
+            except BaseException:
+                # Cancelled mid-write: no watchdog will ever clear the entry.
+                if trace:
+                    self._pending.pop(trace, None)
+                raise
             _LOGGER.debug("Sent message: %s", data)
             if trace:
                 self._create_task(self._async_ack_watchdog(trace, payload, ws), "ack")
@@ -846,6 +853,13 @@ class HaierAC(HaierDevice):
         if value is None:
             return
         self._raw[str(code)] = str(value)
+        if self._deferred_temperature is not None and (
+            (str(code) == str(self.config["status"]) and _norm(value) == "1")
+            or str(code) == str(self.config["target_temperature"])
+        ):
+            # Turned on elsewhere, or the cloud reports its own setpoint: the
+            # value kept for our next turn-on is stale and must not pop up later.
+            self._deferred_temperature = None
         for attr in self.config.get_attrs_by_code(code):
             self._apply_attribute(attr, value)
 
@@ -1132,6 +1146,9 @@ class HaierAC(HaierDevice):
             except HaierCommandLocked as err:
                 # The new mode does not take a setpoint (e.g. fan only).
                 _LOGGER.debug("Dropping the deferred temperature: %s", err.translation_key)
+            except HaierCommandError:
+                # The unit is on already: report the setpoint, do not fail the turn-on.
+                _LOGGER.warning("%s: turned on, but the temperature could not be sent", self.device_name)
 
     async def switch_off(self) -> None:
         await self._send_commands([
