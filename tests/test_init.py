@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntryState
 from homeassistant.core import HomeAssistant
@@ -120,6 +121,28 @@ async def test_diagnostics_are_redacted(hass: HomeAssistant, setup_entry):
     assert scenario["title"] == "Сценарии"
     assert scenario["icon"] == "https://storage.example/icon.png"
     assert diag["haier"]["devices"][0]["device_model"] == "AS25PHP3HRA"
+
+
+async def test_diagnostics_of_a_failed_entry(hass: HomeAssistant, config_entry, mock_cloud):
+    mock_cloud(login_status=429)
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    diag = await async_get_config_entry_diagnostics(hass, config_entry)
+    assert diag["haier"] is None
+    assert EMAIL not in json.dumps(diag)
+
+
+async def test_upstream_token_file_is_removed(hass: HomeAssistant, config_entry, mock_cloud, ws_factory):
+    path = hass.config.path(DOMAIN)
+    await hass.async_add_executor_job(
+        lambda: open(path, "w", encoding="utf-8").write('{"token": "x", "refresh_token": "y"}')
+    )
+    mock_cloud()
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert not await hass.async_add_executor_job(os.path.exists, path)
+    await hass.config_entries.async_unload(config_entry.entry_id)
+    await hass.async_block_till_done()
 
 
 async def test_devices_request_has_no_token_in_log(hass, setup_entry, aioclient_mock, caplog):

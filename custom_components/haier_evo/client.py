@@ -14,6 +14,9 @@ from . import const as C
 from .logger import _LOGGER
 
 TOKEN_MARGIN = timedelta(seconds=60)
+# Used when the auth answer has no parsable "expire": without it every
+# request would refresh the token.
+TOKEN_FALLBACK_TTL = timedelta(hours=1)
 STORAGE_VERSION = 1
 
 
@@ -92,6 +95,9 @@ class HaierClient:
         self._refresh_expire: datetime | None = None
         self._login_blocked_until: float = 0.0
         self._login_backoff: float = C.LOGIN_LIMIT_429
+        # Set once the cloud rejects the password: logging in again with the same
+        # one until reauth only risks a lockout of the account.
+        self._auth_failed = False
 
     @property
     def has_token(self) -> bool:
@@ -144,9 +150,28 @@ class HaierClient:
         """The server rejected the access token: refresh it on next use."""
         self._token_expire = None
 
+    def export_tokens(self) -> dict:
+        """Tokens of a fresh login, handed from the config flow to the entry."""
+        return {
+            "token": self._token,
+            "token_expire": self._token_expire.isoformat() if self._token_expire else None,
+            "refresh_token": self._refresh_token,
+            "refresh_expire": self._refresh_expire.isoformat() if self._refresh_expire else None,
+        }
+
+    async def async_import_tokens(self, data: dict) -> None:
+        self._token = data.get("token")
+        self._token_expire = parse_expire(data.get("token_expire"))
+        self._refresh_token = data.get("refresh_token")
+        self._refresh_expire = parse_expire(data.get("refresh_expire"))
+        await self._async_save_tokens()
+
     def _set_tokens(self, token: dict) -> None:
         self._token = token["accessToken"]
         self._token_expire = parse_expire(token.get("expire"))
+        if self._token_expire is None:
+            _LOGGER.warning("Haier Evo sent no token expiry, assuming %s", TOKEN_FALLBACK_TTL)
+            self._token_expire = dt_util.utcnow() + TOKEN_FALLBACK_TTL
         self._refresh_token = token.get("refreshToken") or None
         self._refresh_expire = parse_expire(token.get("refreshExpire"))
 
@@ -182,6 +207,8 @@ class HaierClient:
         if not isinstance(body, dict):
             if status in (401, 403):
                 raise HaierAuthError(f"HTTP {status}")
+            if status >= 400:
+                raise HaierApiError(f"Auth endpoint answered HTTP {status}")
             raise HaierConnectionError(f"Unexpected auth answer, HTTP {status}")
         error = body.get("error")
         if error:
@@ -193,17 +220,21 @@ class HaierClient:
             if status in (401, 403):
                 raise HaierAuthError(f"HTTP {status}")
             message = error.get("message") if isinstance(error, dict) else error
+            if status >= 400:
+                raise HaierApiError(f"Auth error from server: {message}")
             raise HaierConnectionError(f"Auth error from server: {message}")
         if status in (401, 403):
             raise HaierAuthError(f"HTTP {status}")
         if status >= 400:
-            raise HaierConnectionError(f"Auth endpoint answered HTTP {status}")
+            raise HaierApiError(f"Auth endpoint answered HTTP {status}")
         token = (body.get("data") or {}).get("token") or {}
         if not isinstance(token.get("accessToken"), str) or not token["accessToken"]:
             raise HaierConnectionError("No access token in auth answer")
         return token
 
     async def async_login(self) -> None:
+        if self._auth_failed:
+            raise HaierAuthError("Credentials were rejected, waiting for re-authentication")
         loop_time = asyncio.get_running_loop().time()
         if loop_time < self._login_blocked_until:
             raise HaierRateLimitError(self._login_blocked_until - loop_time)
@@ -217,9 +248,16 @@ class HaierClient:
             self._login_blocked_until = loop_time + err.retry_after
             self._login_backoff = min(self._login_backoff * 2, C.LOGIN_LIMIT_MAX)
             raise
+        except HaierAuthError:
+            self._auth_failed = True
+            raise
         except HaierConnectionError:
             self._login_blocked_until = loop_time + C.LOGIN_LIMIT_PERIOD
             raise
+        except HaierApiError as err:
+            # An unknown 4xx on login is not a verdict on the password: retry later.
+            self._login_blocked_until = loop_time + C.LOGIN_LIMIT_PERIOD
+            raise HaierConnectionError(str(err)) from None
         self._login_backoff = C.LOGIN_LIMIT_429
         self._login_blocked_until = loop_time + C.LOGIN_LIMIT_PERIOD
         self._set_tokens(token)
@@ -244,8 +282,10 @@ class HaierClient:
             ):
                 try:
                     await self._async_refresh()
-                except HaierTokenError:
-                    _LOGGER.info("Refresh token rejected, logging in again")
+                except (HaierTokenError, HaierAuthError, HaierApiError) as err:
+                    # Any refusal of the refresh token (not a network error or
+                    # a 429) means the password has to be used again.
+                    _LOGGER.info("Refresh token rejected (%s), logging in again", err)
                     self._clear_tokens()
                     await self._async_save_tokens()
                 else:
@@ -267,6 +307,10 @@ class HaierClient:
                     if resp.status in (401, 403) and attempt == 0:
                         self.invalidate_access_token()
                         continue
+                    if resp.status == 401:
+                        # A just refreshed token is rejected too. 403 stays an
+                        # API error: stale device-list entries answer it.
+                        raise HaierAuthError("Access token rejected twice")
                     if resp.status == 429:
                         raise HaierRateLimitError(_retry_after(resp, C.LOGIN_LIMIT_429))
                     if resp.status >= 500:
@@ -278,7 +322,7 @@ class HaierClient:
                 raise HaierConnectionError(f"Request failed: {type(err).__name__}") from None
             except ValueError:
                 raise HaierConnectionError("Answer is not JSON") from None
-        raise HaierAuthError("Access token rejected twice")
+        raise HaierApiError("Access to the resource is denied")
 
     async def async_get_devices_page(self) -> dict:
         data = await self.async_get(self._url(C.API_DEVICES))

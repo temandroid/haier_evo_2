@@ -8,6 +8,7 @@ from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
+from . import flow_tokens
 from .client import (
     HaierAuthError,
     HaierClient,
@@ -59,6 +60,8 @@ class HaierEvoConfigFlow(ConfigFlow, domain=DOMAIN):
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Unexpected error while checking Haier Evo login")
             errors["base"] = "unknown"
+        if not errors:
+            flow_tokens(self.hass)[self._unique_id(data)] = client.export_tokens()
         return errors
 
     @staticmethod

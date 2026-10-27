@@ -31,6 +31,20 @@ async def test_user_flow_creates_entry(hass, aioclient_mock):
     assert result["result"].unique_id == f"{EMAIL}_ru"
 
 
+async def test_entry_reuses_the_flow_login(hass, mock_cloud, ws_factory):
+    """One sign-in, not two in a row: the endpoint is quick to answer 429."""
+    aioclient_mock = mock_cloud()
+    result = await _start(hass)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], USER_INPUT)
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+    await ws_factory.wait_for(1)
+    logins = [c for c in aioclient_mock.mock_calls if str(c[1]).endswith("/auth/sign-in")]
+    assert len(logins) == 1
+    await hass.config_entries.async_unload(result["result"].entry_id)
+    await hass.async_block_till_done()
+
+
 async def test_user_flow_invalid_auth(hass, aioclient_mock):
     aioclient_mock.post(
         LOGIN_URL, status=400, json={"error": {"validation": {"password": "Неверный пароль"}}}

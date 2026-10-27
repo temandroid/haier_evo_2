@@ -49,8 +49,12 @@ def _scrub(value: Any) -> Any:
 
 
 async def async_get_config_entry_diagnostics(hass: HomeAssistant, entry) -> dict[str, Any]:
-    haier = entry.runtime_data
+    entry_data = _scrub(async_redact_data(entry.as_dict(), TO_REDACT_ENTRY))
+    # No runtime_data when setup failed, which is exactly when diagnostics matter.
+    haier = getattr(entry, "runtime_data", None)
+    if haier is None:
+        return {"entry": entry_data, "haier": None}
     return {
-        "entry": _scrub(async_redact_data(entry.as_dict(), TO_REDACT_ENTRY)),
+        "entry": entry_data,
         "haier": _scrub(async_redact_data(haier.to_dict(), TO_REDACT)),
     }

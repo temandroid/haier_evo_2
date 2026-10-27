@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import uuid
 
 from homeassistant.config_entries import ConfigEntry
@@ -36,13 +38,36 @@ def token_store(hass: HomeAssistant, entry_id: str) -> Store:
     return Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry_id}", private=True)
 
 
+def flow_tokens(hass: HomeAssistant) -> dict[str, dict]:
+    """Tokens of the login the config flow just made, by unique_id.
+
+    Without them the entry would log in a second time right after the flow,
+    and the sign-in endpoint is quick to answer 429 (upstream #87).
+    """
+    return hass.data.setdefault(DOMAIN, {}).setdefault("flow_tokens", {})
+
+
+def _remove_upstream_token_file(path: str) -> None:
+    """Upstream kept live tokens as plain JSON in /config/haier_evo."""
+    try:
+        with open(path, encoding="utf-8") as file:
+            data = json.load(file)
+    except (OSError, ValueError):
+        return
+    if isinstance(data, dict) and {"token", "refresh_token"} & data.keys():
+        os.remove(path)
+        _LOGGER.info("Removed the token file of the upstream integration")
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: HaierConfigEntry) -> bool:
     if entry.unique_id is None:
         # Entries made by upstream versions have no unique_id.
-        hass.config_entries.async_update_entry(
-            entry,
-            unique_id=f"{str(entry.data[CONF_EMAIL]).strip().lower()}_{entry.data.get(CONF_REGION) or 'ru'}",
-        )
+        unique_id = f"{str(entry.data[CONF_EMAIL]).strip().lower()}_{entry.data.get(CONF_REGION) or 'ru'}"
+        if hass.config_entries.async_entry_for_domain_unique_id(DOMAIN, unique_id) is None:
+            hass.config_entries.async_update_entry(entry, unique_id=unique_id)
+        else:
+            _LOGGER.warning("Another Haier Evo entry already uses this account, leaving this one as is")
+    await hass.async_add_executor_job(_remove_upstream_token_file, hass.config.path(DOMAIN))
     session = async_get_clientsession(hass)
     client = HaierClient(
         session,
@@ -53,6 +78,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: HaierConfigEntry) -> boo
         # Stable per entry; upstream sent a new random Device-Id on every start.
         device_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{DOMAIN}:{entry.entry_id}")),
     )
+    if entry.unique_id and (tokens := flow_tokens(hass).pop(entry.unique_id, None)):
+        await client.async_import_tokens(tokens)
     haier = api.Haier(hass, client, session)
     try:
         await haier.async_setup()

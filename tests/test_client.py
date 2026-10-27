@@ -95,12 +95,49 @@ async def test_rejected_refresh_falls_back_to_login(hass, aioclient_mock, hass_s
     assert aioclient_mock.call_count == 2
 
 
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [(401, {"error": {"message": "Unauthorized"}}), (400, {"error": "token expired"}), (403, None)],
+)
+async def test_any_refresh_refusal_falls_back_to_login(hass, aioclient_mock, hass_storage, status, body):
+    """Otherwise a dead refresh token survives reauth and loops it forever."""
+    hass_storage[STORE_KEY] = {
+        "version": 1,
+        "key": STORE_KEY,
+        "data": {"token": "old", "token_expire": "2000-01-01T00:00:00+03:00", "refresh_token": "dead"},
+    }
+    if body is None:
+        aioclient_mock.post(REFRESH_URL, status=status, text="")
+    else:
+        aioclient_mock.post(REFRESH_URL, status=status, json=body)
+    aioclient_mock.post(LOGIN_URL, json=load_fixture("login.json"))
+    client = make_client(hass)
+    await client.async_load_tokens()
+    assert await client.async_get_token() == "test-access-token"
+    assert aioclient_mock.call_count == 2
+
+
 async def test_wrong_password_is_auth_error(hass, aioclient_mock):
     aioclient_mock.post(
         LOGIN_URL, status=400, json={"error": {"validation": {"password": "Неверный пароль"}}}
     )
+    client = make_client(hass, store=False)
     with pytest.raises(HaierAuthError):
-        await make_client(hass, store=False).async_login()
+        await client.async_login()
+    # no more guesses with the same password until reauth (account lockout)
+    with pytest.raises(HaierAuthError):
+        await client.async_login()
+    assert aioclient_mock.call_count == 1
+
+
+async def test_missing_expiry_does_not_refresh_every_time(hass, aioclient_mock):
+    token = load_fixture("login.json")
+    token["data"]["token"].pop("expire", None)
+    aioclient_mock.post(LOGIN_URL, json=token)
+    client = make_client(hass, store=False)
+    await client.async_get_token()
+    await client.async_get_token()
+    assert aioclient_mock.call_count == 1
 
 
 async def test_429_is_not_a_wrong_password_and_backs_off(hass, aioclient_mock):
