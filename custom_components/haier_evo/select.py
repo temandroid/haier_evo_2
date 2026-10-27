@@ -1,19 +1,18 @@
-import weakref
+from __future__ import annotations
+
 from homeassistant.components.select import SelectEntity
 from homeassistant.core import HomeAssistant
-from .const import DOMAIN
+
 from . import api
 
 
-async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entities) -> bool:
-    haier_object = hass.data[DOMAIN][config_entry.entry_id]
+async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entities) -> None:
+    haier_object: api.Haier = config_entry.runtime_data
     entities = []
     for device in haier_object.devices:
         entities.extend(device.create_entities_select())
     if entities:
         async_add_entities(entities)
-        haier_object.write_ha_state()
-    return True
 
 
 class HaierSelect(SelectEntity):
@@ -21,11 +20,12 @@ class HaierSelect(SelectEntity):
     _attr_icon = "mdi:format-list-bulleted"
 
     def __init__(self, device: api.HaierDevice) -> None:
-        self._device = weakref.proxy(device)
+        self._device = device
         self._device_attr_name = None
         self._attr_options = []
 
-        device.add_write_ha_state_callback(self.async_write_ha_state)
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self._device.add_listener(self.async_write_ha_state))
 
     @property
     def device_info(self) -> dict:
@@ -36,16 +36,15 @@ class HaierSelect(SelectEntity):
         return self._device.available
 
     @property
-    def current_option(self) -> str:
-        return getattr(self._device, self._device_attr_name, None)
+    def current_option(self) -> str | None:
+        value = getattr(self._device, self._device_attr_name, None)
+        return value if value in self.options else None
 
     async def async_select_option(self, option: str) -> None:
-        await self.hass.async_add_executor_job(self.set_option, option)
-
-    def set_option(self, value) -> None:
         method = getattr(self._device, f"set_{self._device_attr_name}", None)
         if method is not None:
-            method(value)
+            await method(option)
+            self.async_write_ha_state()
 
 
 class HaierACEcoSensorSelect(HaierSelect):
