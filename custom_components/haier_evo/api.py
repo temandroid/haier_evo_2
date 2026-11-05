@@ -291,7 +291,7 @@ class Haier:
         except WSServerHandshakeError as err:
             # The exception text contains the URL, i.e. the token: never log it.
             if err.status in (401, 403):
-                self.client.invalidate_access_token()
+                self.client.invalidate_access_token(token)
             raise HaierConnectionError(f"WebSocket handshake failed: HTTP {err.status}") from None
         except (ClientError, TimeoutError) as err:
             raise HaierConnectionError(f"WebSocket connect failed: {type(err).__name__}") from None

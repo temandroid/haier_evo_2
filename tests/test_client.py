@@ -11,6 +11,7 @@ from homeassistant.helpers.storage import Store
 from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClientMockResponse
 
 from custom_components.haier_evo.client import (
+    HaierApiError,
     HaierAuthError,
     HaierClient,
     HaierConnectionError,
@@ -195,3 +196,88 @@ async def test_secrets_never_logged(hass, aioclient_mock, caplog):
     assert PASSWORD not in caplog.text
     assert "test-access-token" not in caplog.text
     assert "test-refresh-token" not in caplog.text
+
+
+def _answers(url: str, aioclient_mock, *answers):
+    queue = [AiohttpClientMockResponse("GET", url, **a) for a in answers]
+
+    async def next_answer(*args):
+        return queue.pop(0)
+
+    aioclient_mock.get(url, side_effect=next_answer)
+
+
+def _paths(aioclient_mock) -> list[str]:
+    return [call[1].path for call in aioclient_mock.mock_calls]
+
+
+async def test_403_is_final_and_keeps_the_token(hass, aioclient_mock):
+    """CR-T-050: stale device-list entries answer 403; that used to rotate the token."""
+    aioclient_mock.post(LOGIN_URL, json=load_fixture("login.json"))
+    aioclient_mock.post(REFRESH_URL, json=load_fixture("login.json"))
+    aioclient_mock.get(DEVICES_URL, status=403, text="")
+    client = make_client(hass, store=False)
+    await client.async_login()
+    with pytest.raises(HaierApiError):
+        await client.async_get_devices_page()
+    paths = _paths(aioclient_mock)
+    assert not any(p.endswith("/auth/refresh") for p in paths)
+    assert sum(p.endswith("/smartHome") for p in paths) == 1
+
+
+async def test_refreshed_token_rejected_logs_in_again(hass, aioclient_mock):
+    """CR-T-050: 401 after a refresh is no verdict on the password: log in, do not reauth."""
+    aioclient_mock.post(LOGIN_URL, json=load_fixture("login.json"))
+    aioclient_mock.post(REFRESH_URL, json=load_fixture("login.json"))
+    _answers(
+        DEVICES_URL, aioclient_mock,
+        {"status": 401, "text": ""},
+        {"status": 401, "text": ""},
+        {"json": load_fixture("devices_page.json")},
+    )
+    client = make_client(hass, store=False)
+    await client.async_login()
+    client._login_blocked_until = 0  # the test does not wait out the login throttle
+    assert "presentation" in await client.async_get_devices_page()
+    paths = _paths(aioclient_mock)
+    assert [p.rsplit("/", 1)[-1] for p in paths] == [
+        "sign-in", "smartHome", "refresh", "smartHome", "sign-in", "smartHome"
+    ]
+
+
+async def test_token_rejected_after_login_is_a_connection_error(hass, aioclient_mock):
+    aioclient_mock.post(LOGIN_URL, json=load_fixture("login.json"))
+    aioclient_mock.post(REFRESH_URL, json=load_fixture("login.json"))
+    aioclient_mock.get(DEVICES_URL, status=401, text="")
+    client = make_client(hass, store=False)
+    await client.async_login()
+    client._login_blocked_until = 0  # the test does not wait out the login throttle
+    with pytest.raises(HaierConnectionError):
+        await client.async_get_devices_page()
+    assert not client._auth_failed
+
+
+async def test_stale_rejection_keeps_a_newer_token(hass, aioclient_mock):
+    """A request in flight with the old token must not drop a just refreshed one."""
+    aioclient_mock.post(LOGIN_URL, json=load_fixture("login.json"))
+    client = make_client(hass, store=False)
+    await client.async_login()
+    client.invalidate_access_token("an-older-token")
+    assert await client.async_get_token() == "test-access-token"
+    assert aioclient_mock.call_count == 1
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_bare_401_403_on_sign_in_is_not_a_wrong_password(hass, aioclient_mock, status):
+    """CR-T-051: a proxy or maintenance page is no reason for reauth."""
+    aioclient_mock.post(LOGIN_URL, status=status, text="<html>Forbidden</html>")
+    client = make_client(hass, store=False)
+    with pytest.raises(HaierConnectionError):
+        await client.async_login()
+    assert not client._auth_failed
+
+
+async def test_json_401_on_sign_in_is_a_wrong_password(hass, aioclient_mock):
+    aioclient_mock.post(LOGIN_URL, status=401, json={"error": {"message": "Unauthorized"}})
+    with pytest.raises(HaierAuthError):
+        await make_client(hass, store=False).async_login()

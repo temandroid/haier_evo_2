@@ -146,9 +146,28 @@ class HaierClient:
             "device_id": self.device_id,
         })
 
-    def invalidate_access_token(self) -> None:
-        """The server rejected the access token: refresh it on next use."""
+    def invalidate_access_token(self, rejected: str | None = None) -> None:
+        """The server rejected the access token: refresh it on next use.
+
+        With `rejected` given, only that token is dropped: a request that was in
+        flight with an older token must not throw away a token another request
+        has just refreshed (each refresh rotates the pair on the server).
+        """
+        if rejected is not None and rejected != self._token:
+            return
         self._token_expire = None
+
+    async def async_relogin(self, rejected: str) -> None:
+        """A refreshed token is rejected too: get a new pair with the password.
+
+        Only the sign-in endpoint can say the password is wrong; a data endpoint
+        refusing a token says nothing about it (CR-T-050).
+        """
+        async with self._lock:
+            if rejected != self._token:
+                return  # someone else already renewed the token
+            self._clear_tokens()
+            await self.async_login()
 
     def export_tokens(self) -> dict:
         """Tokens of a fresh login, handed from the config flow to the entry."""
@@ -183,7 +202,9 @@ class HaierClient:
 
     # --- auth ---
 
-    async def _async_post_auth(self, path: str, data: dict[str, str]) -> dict:
+    async def _async_post_auth(
+        self, path: str, data: dict[str, str], *, login: bool = False
+    ) -> dict:
         url = self._url(path)
         try:
             async with self._session.post(
@@ -206,6 +227,10 @@ class HaierClient:
 
         if not isinstance(body, dict):
             if status in (401, 403):
+                if login:
+                    # A bare 401/403 page (proxy, WAF, maintenance) is no verdict
+                    # on the password: retrying later is safe, reauth is not (CR-T-051).
+                    raise HaierApiError(f"Sign-in answered HTTP {status} without details")
                 raise HaierAuthError(f"HTTP {status}")
             if status >= 400:
                 raise HaierApiError(f"Auth endpoint answered HTTP {status}")
@@ -241,7 +266,7 @@ class HaierClient:
         _LOGGER.debug("Logging in to Haier Evo (%s)", self.region)
         try:
             token = await self._async_post_auth(
-                C.API_LOGIN, {"email": self.email, "password": self._password}
+                C.API_LOGIN, {"email": self.email, "password": self._password}, login=True
             )
         except HaierRateLimitError as err:
             # Upstream #87: 429 is not a wrong password. Back off, double every time.
@@ -296,7 +321,17 @@ class HaierClient:
     # --- data ---
 
     async def async_get(self, url: str) -> Any:
-        for attempt in range(2):
+        """GET with the access token.
+
+        401: refresh the token and retry; a refreshed token rejected too gets a
+        pause (the IoT backend may not know a just issued token yet) and a fresh
+        login. Still 401 after that is a cloud problem, not a wrong password: it
+        is raised as a connection error, so setup retries instead of asking the
+        user to re-authenticate (CR-T-050). 403 is the answer for stale entries
+        of the device list: it is final and does not touch the token, otherwise
+        every start rotated the token once per stale entry.
+        """
+        for attempt in range(3):
             token = await self.async_get_token()
             try:
                 async with self._session.get(
@@ -304,25 +339,29 @@ class HaierClient:
                     headers={**self._headers(token), "Content-Type": "application/json"},
                     timeout=ClientTimeout(total=C.API_TIMEOUT),
                 ) as resp:
-                    if resp.status in (401, 403) and attempt == 0:
-                        self.invalidate_access_token()
-                        continue
-                    if resp.status == 401:
-                        # A just refreshed token is rejected too. 403 stays an
-                        # API error: stale device-list entries answer it.
-                        raise HaierAuthError("Access token rejected twice")
-                    if resp.status == 429:
+                    status = resp.status
+                    if status == 401:
+                        pass  # handled below, outside the response context
+                    elif status == 429:
                         raise HaierRateLimitError(_retry_after(resp, C.LOGIN_LIMIT_429))
-                    if resp.status >= 500:
-                        raise HaierConnectionError(f"HTTP {resp.status}")
-                    if resp.status >= 400:
-                        raise HaierApiError(f"HTTP {resp.status}")
-                    return await resp.json(content_type=None)
+                    elif status >= 500:
+                        raise HaierConnectionError(f"HTTP {status}")
+                    elif status >= 400:
+                        raise HaierApiError(f"HTTP {status}")
+                    else:
+                        return await resp.json(content_type=None)
             except (ClientError, TimeoutError) as err:
                 raise HaierConnectionError(f"Request failed: {type(err).__name__}") from None
             except ValueError:
                 raise HaierConnectionError("Answer is not JSON") from None
-        raise HaierApiError("Access to the resource is denied")
+            if attempt == 0:
+                _LOGGER.debug("Access token rejected, refreshing it")
+                self.invalidate_access_token(token)
+            elif attempt == 1:
+                _LOGGER.info("Refreshed Haier Evo token rejected too, logging in again")
+                await asyncio.sleep(C.TOKEN_RETRY_DELAY)
+                await self.async_relogin(token)
+        raise HaierConnectionError("Access token rejected even after a fresh login")
 
     async def async_get_devices_page(self) -> dict:
         data = await self.async_get(self._url(C.API_DEVICES))

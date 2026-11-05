@@ -7,6 +7,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceInfo
 
 from . import api
 
@@ -22,6 +23,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
 
 class HaierSensor(SensorEntity):
     _attr_should_poll = False
+    # Names describe the function only; HA puts the device name in front.
+    _attr_has_entity_name = True
 
     def __init__(self, device: api.HaierDevice):
         self._device = device
@@ -31,7 +34,7 @@ class HaierSensor(SensorEntity):
         self.async_on_remove(self._device.add_listener(self.async_write_ha_state))
 
     @property
-    def device_info(self) -> dict:
+    def device_info(self) -> DeviceInfo:
         return self._device.device_info
 
     @property
@@ -51,7 +54,7 @@ class HaierREFTemperatureSensor(HaierSensor):
         super().__init__(device)
         self._device_attr_name = "current_temperature"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_temperature"
-        self._attr_name = f"{device.device_name} Температура в помещении"
+        self._attr_name = "Температура в помещении"
 
 
 class HaierREFFridgeTemperatureSensor(HaierREFTemperatureSensor):
@@ -60,7 +63,7 @@ class HaierREFFridgeTemperatureSensor(HaierREFTemperatureSensor):
         super().__init__(device)
         self._device_attr_name = "current_fridge_temperature"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_fridge_temperature"
-        self._attr_name = f"{device.device_name} Температура холодильной камеры"
+        self._attr_name = "Температура холодильной камеры"
 
 
 class HaierREFFreezerTemperatureSensor(HaierREFTemperatureSensor):
@@ -69,7 +72,7 @@ class HaierREFFreezerTemperatureSensor(HaierREFTemperatureSensor):
         super().__init__(device)
         self._device_attr_name = "current_freezer_temperature"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_freezer_temperature"
-        self._attr_name = f"{device.device_name} Температура морозильной камеры"
+        self._attr_name = "Температура морозильной камеры"
 
 
 class HaierREFFridgeModeSensor(HaierREFTemperatureSensor):
@@ -78,7 +81,7 @@ class HaierREFFridgeModeSensor(HaierREFTemperatureSensor):
         super().__init__(device)
         self._device_attr_name = "fridge_mode"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_fridge_mode"
-        self._attr_name = f"{device.device_name} Режим холодильной камеры"
+        self._attr_name = "Режим холодильной камеры"
 
     @property
     def native_value(self) -> float | None:
@@ -91,7 +94,7 @@ class HaierREFFreezerModeSensor(HaierREFFridgeModeSensor):
         super().__init__(device)
         self._device_attr_name = "freezer_mode"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_freezer_mode"
-        self._attr_name = f"{device.device_name} Режим морозильной камеры"
+        self._attr_name = "Режим морозильной камеры"
 
 
 class HaierWMRemainingTimeSensor(HaierSensor):
@@ -100,7 +103,7 @@ class HaierWMRemainingTimeSensor(HaierSensor):
         super().__init__(device)
         self._device_attr_name = "remaining_time"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_remaining_time"
-        self._attr_name = f"{device.device_name} Оставшееся время"
+        self._attr_name = "Оставшееся время"
         self._attr_native_unit_of_measurement = "мин"
 
 
@@ -110,7 +113,7 @@ class HaierWMStatusSensor(HaierSensor):
         super().__init__(device)
         self._device_attr_name = "status"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_status"
-        self._attr_name = f"{device.device_name} Статус"
+        self._attr_name = "Статус"
 
     @property
     def native_value(self) -> str | None:
@@ -130,4 +133,4 @@ class HaierACOutdoorTemperatureSensor(HaierSensor):
         super().__init__(device)
         self._device_attr_name = "outdoor_temperature"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_outdoor_temperature"
-        self._attr_name = f"{device.device_name} Температура наружного блока"
+        self._attr_name = "Температура наружного блока"

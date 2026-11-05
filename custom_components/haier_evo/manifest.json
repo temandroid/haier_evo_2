@@ -1,6 +1,9 @@
 {
   "domain": "haier_evo",
   "name": "Haier Evo",
+  "categories": [
+    "climate.heat_pumps_air_conditioning"
+  ],
   "codeowners": [
     "@temandroid",
     "@and7ey"
@@ -12,5 +15,5 @@
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/temandroid/haier_evo_2/issues",
   "requirements": [],
-  "version": "0.4.0-dev"
+  "version": "0.5.0"
 }

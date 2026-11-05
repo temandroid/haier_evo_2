@@ -6,6 +6,7 @@ from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 
+from custom_components.haier_evo import entry_device_id
 from custom_components.haier_evo.const import DOMAIN
 
 from .conftest import EMAIL, LOGIN_URL, PASSWORD, load_fixture
@@ -102,6 +103,8 @@ async def test_reauth(hass, aioclient_mock, config_entry):
     assert result["reason"] == "reauth_successful"
     assert config_entry.data["password"] == "new-password"
     assert config_entry.data["email"] == EMAIL
+    # the login is made as the entry: its tokens are bound to the same Device-Id
+    assert aioclient_mock.mock_calls[0][3]["Device-Id"] == entry_device_id(config_entry.entry_id)
 
 
 async def test_reconfigure(hass, aioclient_mock, config_entry):

@@ -1,9 +1,10 @@
 # Haier Evo integration
-[![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/custom-components/hacs) [![stability-beta](https://img.shields.io/badge/stability-beta-33bbff.svg)](https://github.com/mkenney/software-guides/blob/master/STABILITY-BADGES.md#beta)
+[![Marketplace](https://img.shields.io/badge/Marketplace-custom%20repository-orange.svg)](https://www.home-assistant.io/integrations/marketplace/) [![stability-beta](https://img.shields.io/badge/stability-beta-33bbff.svg)](https://github.com/mkenney/software-guides/blob/master/STABILITY-BADGES.md#beta)
 
 Неофициальная интеграция для работы [Haier Evo](https://haieronline.ru/evo-iot/) (RU, KZ, BY).
 
-Бета-версия: может работать некорректно.
+Бета-версия: может работать некорректно. Нужен Home Assistant **2026.11** или новее
+(устанавливается через встроенный Marketplace).
 
 ## Поддерживаемые устройства
 Ниже приведен список типов устройств, работа с которыми была **проверена пользователями**:

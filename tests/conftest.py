@@ -47,6 +47,7 @@ def fast_timings():
         patch.object(C, "WS_BACKOFF_MIN", 0.01),
         patch.object(C, "WS_BACKOFF_MAX", 0.05),
         patch.object(C, "WS_SEND_TIMEOUT", 1),
+        patch.object(C, "TOKEN_RETRY_DELAY", 0),
         # the fake socket never answers command_response unless a test says so
         patch.object(C, "WS_ACK_TIMEOUT", 60),
     ):
