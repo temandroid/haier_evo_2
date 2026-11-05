@@ -1,11 +1,11 @@
 # Haier Evo integration
-[![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/custom-components/hacs) [![stability-beta](https://img.shields.io/badge/stability-beta-33bbff.svg)](https://github.com/mkenney/software-guides/blob/master/STABILITY-BADGES.md#beta)
+[![Marketplace](https://img.shields.io/badge/Marketplace-custom%20repository-orange.svg)](https://www.home-assistant.io/integrations/marketplace/) [![stability-beta](https://img.shields.io/badge/stability-beta-33bbff.svg)](https://github.com/mkenney/software-guides/blob/master/STABILITY-BADGES.md#beta)
 
 Неофициальная интеграция для работы [Haier Evo](https://haieronline.ru/evo-iot/) (RU, KZ, BY).
 
 Бета-версия: может работать некорректно.
 
-> **Это форк** [and7ey/haier_evo](https://github.com/and7ey/haier_evo) (версия 0.4.0-dev).
+> **Это форк** [and7ey/haier_evo](https://github.com/and7ey/haier_evo) (версия 0.5.0, нужен Home Assistant **2026.11** или новее).
 > Домен тот же (`haier_evo`), поэтому одновременно с апстримом не ставится.
 > Что изменено — в разделе [«Отличия от апстрима»](#отличия-от-апстрима).
 
@@ -29,20 +29,29 @@ Haier предлагает разные мобильные приложения 
 
 ## Установка
 
-### 1. Установка HACS (если не установлен)
-Для работы интеграции требуется наличие HACS.
-Инструкция для установки https://www.hacs.xyz/docs/use/download/download/
+С Home Assistant 2026.11 вместо HACS встроенный **Marketplace** (Настройки → Marketplace).
+Каталог и `hacs.json` у него те же, установки из HACS переезжают в него сами.
+Минимальная версия HA для этой интеграции — **2026.11.0**: на более старой установка
+не предлагается.
 
-### 2. Добавление репозитория Haier Evo
+### 1. Добавление репозитория
 
-Так как интеграция является кастомной, её необходимо добавить в HACS как пользовательский репозиторий:
+Интеграции нет в общем каталоге, её добавляют как пользовательский репозиторий:
 
-1. Откройте **HACS** в боковой панели Home Assistant.
-2. Нажмите на три точки (⋮) в верхнем правом углу и выберите **Custom repositories** (Пользовательские репозитории).
-3. В поле **Repository** вставьте ссылку: `https://github.com/temandroid/haier_evo_2`
-4. В поле **Category** выберите **Integration** (Интеграция).
-5. Нажмите **Add** (Добавить).
-6. Теперь найдите **Haier Evo** в поиске HACS и нажмите **Download** (Загрузить).
+1. **Настройки → Marketplace → ⋮ → Add from link** (Добавить по ссылке).
+2. Вставьте `https://github.com/temandroid/haier_evo_2`. Для пользовательских репозиториев
+   Marketplace просит подключить GitHub: вход по коду устройства, пароль в HA не вводится,
+   доступ только к публичным данным.
+3. Откройте **Haier Evo** и нажмите **Download** (Скачать). Ставьте **релиз** (`v0.5.0` и
+   новее): по релизам работают номер версии и обновления в «Настройки → Обновления».
+   Без релиза Marketplace ставит последний коммит ветки по умолчанию и показывает вместо
+   версии хеш.
+
+### 2. Обновления
+
+Новый релиз появляется в **Настройки → Обновления** (для пользовательских репозиториев —
+в течение 48 часов, через подключение к GitHub). После обновления нужен перезапуск, HA
+предложит его сам. Предыдущую версию можно поставить из меню репозитория в Marketplace.
 
 ### 3. Настройка
 
@@ -87,18 +96,27 @@ Haier предлагает разные мобильные приложения 
 - Профиль модели из `/config/haier_evo.<МОДЕЛЬ>.yaml` по-прежнему главнее встроенного, но
   автоматически больше не создаётся (раньше копия навсегда замораживала профиль).
 - `logger:` из `configuration.yaml` снова работает для `custom_components.haier_evo`.
-- Профили `AS25PHP3HRA` и `AS70S2SF2FA` (пока копии соседних моделей, на живом не проверены).
+- Профили `AS25PHP3HRA` и `AS70S2SF2FA` (коды атрибутов сверены с живыми блоками).
+- **Отказ токена не превращается в «неверный пароль»**: неверный пароль может сказать
+  только вход по паролю. Отклонённый после обновления токен — пауза и новый вход, а если
+  облако всё равно отказывает, запись повторяет запуск сама, без запроса пароля.
+- Под HA 2026.11: температуры климата через `native_*`, имена сущностей через
+  `has_entity_name` (полные имена и `entity_id` не меняются), категория
+  `climate.heat_pumps_air_conditioning` в манифесте.
 
 ## Разработка
 
 Тесты гоняются на Linux (Home Assistant не работает на Windows):
 
 ```bash
-python3.14 -m venv .venv && . .venv/bin/activate
-pip install -r requirements_test.txt
+uv venv -p 3.14 .venv && . .venv/bin/activate
+bash scripts/install_test_env.sh   # HA 2026.11.0, см. комментарий в скрипте
 ruff check custom_components tests
 pytest -q
 ```
+
+Выпуск версии: `version` в `manifest.json` = тег релиза без `v` (тег `v0.5.0` → `0.5.0`),
+и обязательно **GitHub Release**, а не просто тег — Marketplace берёт версию из релизов.
 
 Облако в тестах замокано, фикстуры синтетические: MAC-адреса из документационного
 диапазона RFC 7042, без персональных данных.

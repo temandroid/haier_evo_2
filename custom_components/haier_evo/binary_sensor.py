@@ -8,6 +8,7 @@ from homeassistant.components.binary_sensor import (
 )
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceInfo
 
 from . import api
 
@@ -23,6 +24,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
 
 class HaierBinarySensor(BinarySensorEntity):
     _attr_should_poll = False
+    # Names describe the function only; HA puts the device name in front.
+    _attr_has_entity_name = True
 
     def __init__(self, device: api.HaierDevice) -> None:
         self._device = device
@@ -32,7 +35,7 @@ class HaierBinarySensor(BinarySensorEntity):
         self.async_on_remove(self._device.add_listener(self.async_write_ha_state))
 
     @property
-    def device_info(self) -> dict:
+    def device_info(self) -> DeviceInfo:
         return self._device.device_info
 
     @property
@@ -54,7 +57,7 @@ class HaierREFDoorSensor(HaierREFBinarySensor):
         super().__init__(device)
         self._device_attr_name = "door_open"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_door_open"
-        self._attr_name = f"{device.device_name} Дверь"
+        self._attr_name = "Дверь"
 
 
 class HaierREFVacationSensor(HaierREFBinarySensor):
@@ -63,7 +66,7 @@ class HaierREFVacationSensor(HaierREFBinarySensor):
         super().__init__(device)
         self._device_attr_name = "vacation_mode"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_vacation"
-        self._attr_name = f"{device.device_name} Режим Отпуск"
+        self._attr_name = "Режим Отпуск"
 
 
 class HaierREFSuperFreezeSensor(HaierREFBinarySensor):
@@ -72,7 +75,7 @@ class HaierREFSuperFreezeSensor(HaierREFBinarySensor):
         super().__init__(device)
         self._device_attr_name = "super_freeze"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_super_freeze"
-        self._attr_name = f"{device.device_name} Супер-заморозка"
+        self._attr_name = "Супер-заморозка"
 
 
 class HaierREFSuperCoolingSensor(HaierREFBinarySensor):
@@ -81,7 +84,7 @@ class HaierREFSuperCoolingSensor(HaierREFBinarySensor):
         super().__init__(device)
         self._device_attr_name = "super_cooling"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_super_cooling"
-        self._attr_name = f"{device.device_name} Супер-охлаждение"
+        self._attr_name = "Супер-охлаждение"
 
 
 class HaierACProblemSensor(HaierBinarySensor):
@@ -93,7 +96,7 @@ class HaierACProblemSensor(HaierBinarySensor):
     def __init__(self, device: api.HaierAC) -> None:
         super().__init__(device)
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_problem"
-        self._attr_name = f"{device.device_name} Ошибка"
+        self._attr_name = "Ошибка"
 
     @property
     def is_on(self) -> bool:

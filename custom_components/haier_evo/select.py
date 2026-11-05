@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from homeassistant.components.select import SelectEntity
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceInfo
 
 from . import api
 
@@ -17,6 +18,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
 
 class HaierSelect(SelectEntity):
     _attr_should_poll = False
+    # Names describe the function only; HA puts the device name in front.
+    _attr_has_entity_name = True
     _attr_icon = "mdi:format-list-bulleted"
 
     def __init__(self, device: api.HaierDevice) -> None:
@@ -28,7 +31,7 @@ class HaierSelect(SelectEntity):
         self.async_on_remove(self._device.add_listener(self.async_write_ha_state))
 
     @property
-    def device_info(self) -> dict:
+    def device_info(self) -> DeviceInfo:
         return self._device.device_info
 
     @property
@@ -54,7 +57,7 @@ class HaierACEcoSensorSelect(HaierSelect):
         super().__init__(device)
         self._device_attr_name = "eco_sensor"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_eco_sensor"
-        self._attr_name = f"{device.device_name} Эко-датчик"
+        self._attr_name = "Эко-датчик"
         self._attr_options = device.get_eco_sensor_options()
 
 
@@ -64,7 +67,7 @@ class HaierREFFridgeModeSelect(HaierSelect):
         super().__init__(device)
         self._device_attr_name = "fridge_mode"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_fridge_mode_select"
-        self._attr_name = f"{device.device_name} Режим холодильной камеры"
+        self._attr_name = "Режим холодильной камеры"
         self._attr_options = device.get_fridge_mode_options()
 
 
@@ -74,7 +77,7 @@ class HaierREFFreezerModeSelect(HaierSelect):
         super().__init__(device)
         self._device_attr_name = "freezer_mode"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_freezer_mode_select"
-        self._attr_name = f"{device.device_name} Режим морозильной камеры"
+        self._attr_name = "Режим морозильной камеры"
         self._attr_options = device.get_freezer_mode_options()
 
 
@@ -84,7 +87,7 @@ class HaierREFMyZoneSelect(HaierSelect):
         super().__init__(device)
         self._device_attr_name = "my_zone"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_my_zone"
-        self._attr_name = f"{device.device_name} My Zone"
+        self._attr_name = "My Zone"
         self._attr_options = device.get_my_zone_options()
 
 
@@ -94,7 +97,7 @@ class HaierWMProgramSelect(HaierSelect):
         super().__init__(device)
         self._device_attr_name = "program"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_program"
-        self._attr_name = f"{device.device_name} Программа"
+        self._attr_name = "Программа"
         self._attr_options = device.get_program_options()
 
 
@@ -104,7 +107,7 @@ class HaierWMTemperatureSelect(HaierSelect):
         super().__init__(device)
         self._device_attr_name = "temperature"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_temperature"
-        self._attr_name = f"{device.device_name} Температура"
+        self._attr_name = "Температура"
         self._attr_options = device.get_temperature_options()
 
 
@@ -114,5 +117,5 @@ class HaierWMSpinSpeedSelect(HaierSelect):
         super().__init__(device)
         self._device_attr_name = "spin_speed"
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_spin_speed"
-        self._attr_name = f"{device.device_name} Скорость отжима"
+        self._attr_name = "Скорость отжима"
         self._attr_options = device.get_spin_speed_options()
