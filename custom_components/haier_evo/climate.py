@@ -6,6 +6,7 @@ from homeassistant.components.climate import ClimateEntity
 from homeassistant.components.climate.const import HVACMode
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import api
@@ -28,12 +29,15 @@ class HaierACEntity(ClimateEntity):
     _attr_translation_key = "conditioner"
     _attr_should_poll = False
     _attr_icon = "mdi:air-conditioner"
-    _attr_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_has_entity_name = True
+    # HA 2026.11: temperatures are reported in the native unit (native_*).
+    _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
 
     def __init__(self, device: api.HaierAC) -> None:
         self._device = device
         self._attr_unique_id = f"{device.device_id}_{device.device_model}"
-        self._attr_name = device.device_name
+        # The main entity of the device: its name is the device name.
+        self._attr_name = None
         self._attr_supported_features = device.get_supported_features()
         self._attr_hvac_modes = device.get_hvac_modes()
         self._attr_fan_modes = device.get_fan_modes()
@@ -91,11 +95,11 @@ class HaierACEntity(ClimateEntity):
         return self._device.min_temperature
 
     @property
-    def current_temperature(self) -> float | None:
+    def native_current_temperature(self) -> float | None:
         return self._device.current_temperature
 
     @property
-    def target_temperature(self) -> float | None:
+    def native_target_temperature(self) -> float | None:
         return self._device.target_temperature
 
     @property
@@ -107,7 +111,7 @@ class HaierACEntity(ClimateEntity):
         return self._device.available
 
     @property
-    def device_info(self):
+    def device_info(self) -> DeviceInfo:
         return self._device.device_info
 
     async def async_set_temperature(self, **kwargs: Any) -> None:

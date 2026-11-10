@@ -8,7 +8,7 @@ from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from . import flow_tokens
+from . import entry_device_id, flow_tokens
 from .client import (
     HaierAuthError,
     HaierClient,
@@ -39,13 +39,21 @@ class HaierEvoConfigFlow(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
-    async def _async_check(self, data: Mapping[str, Any]) -> dict[str, str]:
+    async def _async_check(
+        self, data: Mapping[str, Any], entry_id: str | None = None
+    ) -> dict[str, str]:
         errors: dict[str, str] = {}
         email = str(data[CONF_EMAIL]).strip()
         if len(email) < 3 or "@" not in email:
             return {CONF_EMAIL: "invalid_email"}
+        # Reauth and reconfigure log in as the entry itself: tokens handed over
+        # to it then match its Device-Id.
         client = HaierClient(
-            async_get_clientsession(self.hass), email, data[CONF_PASSWORD], data[CONF_REGION]
+            async_get_clientsession(self.hass),
+            email,
+            data[CONF_PASSWORD],
+            data[CONF_REGION],
+            device_id=entry_device_id(entry_id) if entry_id else None,
         )
         try:
             await client.async_login()
@@ -96,7 +104,7 @@ class HaierEvoConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             data = {**entry.data, CONF_PASSWORD: user_input[CONF_PASSWORD]}
-            errors = await self._async_check(data)
+            errors = await self._async_check(data, entry.entry_id)
             if not errors:
                 return self.async_update_reload_and_abort(entry, data=data)
         return self.async_show_form(
@@ -115,7 +123,7 @@ class HaierEvoConfigFlow(ConfigFlow, domain=DOMAIN):
             user_input[CONF_EMAIL] = str(user_input[CONF_EMAIL]).strip()
             await self.async_set_unique_id(self._unique_id(user_input))
             self._abort_if_unique_id_mismatch(reason="wrong_account")
-            errors = await self._async_check(user_input)
+            errors = await self._async_check(user_input, entry.entry_id)
             if not errors:
                 return self.async_update_reload_and_abort(
                     entry,

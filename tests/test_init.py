@@ -6,13 +6,24 @@ import os
 
 from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntryState
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.haier_evo.const import DOMAIN
 from custom_components.haier_evo.diagnostics import async_get_config_entry_diagnostics
 
-from .conftest import DEVICES_URL, EMAIL, LOGIN_URL, MAC_1, MAC_2, PASSWORD
+from .conftest import (
+    DEVICES_URL,
+    EMAIL,
+    LOGIN_URL,
+    MAC_1,
+    MAC_2,
+    PASSWORD,
+    REFRESH_URL,
+    load_fixture,
+    status_url,
+)
 
 
 async def test_setup_creates_entities(hass: HomeAssistant, setup_entry):
@@ -148,3 +159,37 @@ async def test_upstream_token_file_is_removed(hass: HomeAssistant, config_entry,
 async def test_devices_request_has_no_token_in_log(hass, setup_entry, aioclient_mock, caplog):
     assert DEVICES_URL.split("?")[0] in str(aioclient_mock.mock_calls[1][1])
     assert "test-access-token" not in caplog.text
+
+
+async def test_token_rejected_on_setup_retries_instead_of_reauth(
+    hass: HomeAssistant, config_entry, mock_cloud, aioclient_mock
+):
+    """CR-T-050: 2026-11-04, after a power cut, 'Access token rejected twice' ended in reauth."""
+    mock_cloud()
+    aioclient_mock.clear_requests()
+    aioclient_mock.post(LOGIN_URL, json=load_fixture("login.json"))
+    aioclient_mock.post(REFRESH_URL, json=load_fixture("login.json"))
+    aioclient_mock.get(DEVICES_URL, json=load_fixture("devices_page.json"))
+    aioclient_mock.get(status_url(MAC_1), status=403, text="")
+    aioclient_mock.get(status_url(MAC_2), status=401, text="")
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert config_entry.state is ConfigEntryState.SETUP_RETRY
+    assert not hass.config_entries.flow.async_progress()
+
+
+async def test_names_and_native_temperatures(hass: HomeAssistant, setup_entry, caplog):
+    """HA 2026.11: has_entity_name, native_* climate temperatures, no deprecation warnings."""
+    registry = er.async_get(hass)
+    entries = er.async_entries_for_config_entry(registry, setup_entry.entry_id)
+    assert entries and all(e.has_entity_name for e in entries)
+    climate_id = registry.async_get_entity_id("climate", DOMAIN, f"{MAC_1}_AS25PHP3HRA")
+    climate = registry.async_get(climate_id)
+    device = dr.async_get(hass).async_get(climate.device_id)
+    assert climate.original_name is None
+    assert hass.states.get(climate_id).name == device.name
+    light = next(e for e in entries if e.entity_id.startswith("switch.") and e.device_id == climate.device_id
+                 and e.original_name == "Подсветка")
+    assert hass.states.get(light.entity_id).name == f"{device.name} Подсветка"
+    assert hass.states.get(climate_id).attributes["current_temperature"] == 22.5
+    assert "deprecated" not in caplog.text

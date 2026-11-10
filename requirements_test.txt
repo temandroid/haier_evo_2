@@ -1,3 +1,4 @@
-# Matches Home Assistant 2026.10.4, the version this fork runs on.
+# The plugin pins Home Assistant 2026.10.4; scripts/install_test_env.sh installs
+# 2026.11.0 over it (the minimum of this integration) until a 2026.11 plugin is out.
 pytest-homeassistant-custom-component==0.13.375
 ruff==0.17.3

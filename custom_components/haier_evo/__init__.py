@@ -38,6 +38,11 @@ def token_store(hass: HomeAssistant, entry_id: str) -> Store:
     return Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry_id}", private=True)
 
 
+def entry_device_id(entry_id: str) -> str:
+    """Stable Device-Id per entry; upstream sent a new random one on every start."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{DOMAIN}:{entry_id}"))
+
+
 def flow_tokens(hass: HomeAssistant) -> dict[str, dict]:
     """Tokens of the login the config flow just made, by unique_id.
 
@@ -59,7 +64,7 @@ def _remove_upstream_token_file(path: str) -> None:
         _LOGGER.info("Removed the token file of the upstream integration")
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: HaierConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: HaierConfigEntry) -> None:
     if entry.unique_id is None:
         # Entries made by upstream versions have no unique_id.
         unique_id = f"{str(entry.data[CONF_EMAIL]).strip().lower()}_{entry.data.get(CONF_REGION) or 'ru'}"
@@ -75,8 +80,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HaierConfigEntry) -> boo
         entry.data[CONF_PASSWORD],
         entry.data.get(CONF_REGION) or "ru",
         store=token_store(hass, entry.entry_id),
-        # Stable per entry; upstream sent a new random Device-Id on every start.
-        device_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{DOMAIN}:{entry.entry_id}")),
+        device_id=entry_device_id(entry.entry_id),
     )
     if entry.unique_id and (tokens := flow_tokens(hass).pop(entry.unique_id, None)):
         await client.async_import_tokens(tokens)
@@ -98,14 +102,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: HaierConfigEntry) -> boo
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     haier.start(entry)
     _LOGGER.debug("Haier Evo set up with %d device(s)", len(haier.devices))
-    return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: HaierConfigEntry) -> bool:
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unload_ok:
-        await entry.runtime_data.async_stop()
-    return unload_ok
+async def async_unload_entry(hass: HomeAssistant, entry: HaierConfigEntry) -> None:
+    # HA 2026.11: entry functions return None, a failed unload raises.
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+    await entry.runtime_data.async_stop()
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:

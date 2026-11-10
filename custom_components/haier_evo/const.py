@@ -9,6 +9,9 @@ REGIONS = ["ru", "kz", "by"]
 LOGIN_LIMIT_PERIOD = 15
 LOGIN_LIMIT_429 = 60
 LOGIN_LIMIT_MAX = 900
+# A just refreshed token rejected by the IoT backend: wait this long before
+# a fresh login (the token may simply not have reached it yet).
+TOKEN_RETRY_DELAY = 3
 
 API_TIMEOUT = 15
 API_PATH = "https://evo.haieronline.ru"
