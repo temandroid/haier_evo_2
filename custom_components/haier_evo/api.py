@@ -98,6 +98,40 @@ def parse_device_list(data: dict) -> list[dict[str, str]]:
     return devices
 
 
+def _normalized(value: Any) -> str:
+    text = str(value).strip().lower()
+    return {"true": "1", "false": "0"}.get(text, text)
+
+
+def _same_value(current: Any, wanted: Any) -> bool:
+    a, b = _normalized(current), _normalized(wanted)
+    try:
+        return float(a) == float(b)  # "24.00" == "24"
+    except ValueError:
+        return a == b
+
+
+def command_applied(payload: dict, status: dict) -> bool:
+    """True if a REST status already holds every value the command asks for.
+
+    The cloud answers a command for a value the unit already has with a
+    non-zero errNo too (-1 for a setpoint or a mode, 22 for power, as seen in
+    the AGrigorii fork): that is no rejection.
+    """
+    current = {
+        str(attr.get("name")): attr.get("currentValue")
+        for attr in (status or {}).get("attributes") or []
+        if isinstance(attr, dict)
+    }
+    commands = payload.get("commands") or ([payload["command"]] if payload.get("command") else [])
+    return bool(commands) and all(
+        isinstance(command, dict)
+        and current.get(str(command.get("commandName"))) is not None
+        and _same_value(current[str(command.get("commandName"))], command.get("value"))
+        for command in commands
+    )
+
+
 class Haier:
     """One Evo account: device list, WebSocket and command delivery."""
 
@@ -112,6 +146,15 @@ class Haier:
         self._session = session
         self.devices: list[HaierDevice] = []
         self.backend_data: dict | None = None
+        # The parsed device list ({mac, type, serial, title}) of the last setup.
+        self.device_list: list[dict[str, str]] = []
+        # Built from the saved descriptions: the cloud did not answer at start.
+        self.from_cache = False
+        # Called after a full REST refresh: the statuses are worth saving.
+        self.on_refreshed: Callable[[], None] | None = None
+        # Store of the saved descriptions (set by the entry setup).
+        self.cache_store: Any = None
+        self._silent_sessions = 0
         self._entry: ConfigEntry | None = None
         self._ws: ClientWebSocketResponse | None = None
         self._connected = asyncio.Event()
@@ -135,9 +178,9 @@ class Haier:
             "reconnects": self.reconnects,
             "lost_commands": self.lost_commands,
             # The raw page embeds MACs inside JSON strings: keep only the summary.
+            "from_cache": self.from_cache,
             "device_list": [
-                {"type": d["type"], "title": d["title"]}
-                for d in parse_device_list(self.backend_data or {})
+                {"type": d["type"], "title": d["title"]} for d in self.device_list
             ],
             "devices": [device.to_dict() for device in self.devices],
         }
@@ -167,12 +210,45 @@ class Haier:
         found = parse_device_list(self.backend_data)
         if not found:
             raise HaierEmptyDeviceList("Device list is empty")
+        described: list[tuple[dict, dict]] = []
         for info in found:
             try:
                 status = await self.client.async_get_device_status(info["mac"])
             except HaierApiError as err:
                 _LOGGER.warning("Skipping device %s: %s", info["title"] or info["mac"], err)
                 continue
+            described.append((info, status))
+        if not described:
+            raise HaierEmptyDeviceList("No device status could be read")
+        # Devices are kept only once all of them are read: a failed setup
+        # leaves nothing behind for the fallback to the saved descriptions.
+        self.devices = await self._async_build_devices(described)
+        self.device_list = found
+
+    async def async_setup_from_cache(self, cached: Any) -> None:
+        """Build the devices from the descriptions of the last good start.
+
+        Raises ValueError when the saved data is not usable.
+        """
+        items = cached.get("devices") if isinstance(cached, dict) else None
+        if not isinstance(items, list) or not items:
+            raise ValueError("no saved devices")
+        described = []
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get("status"), dict):
+                raise ValueError("a saved device has no status")
+            info = {key: str(item.get(key) or "") for key in ("mac", "type", "serial", "title")}
+            if not info["mac"]:
+                raise ValueError("a saved device has no MAC")
+            described.append((info, item["status"]))
+        await self.client.async_load_tokens()
+        self.devices = await self._async_build_devices(described)
+        self.device_list = [info for info, _ in described]
+        self.from_cache = True
+
+    async def _async_build_devices(self, described: list[tuple[dict, dict]]) -> list[HaierDevice]:
+        devices = []
+        for info, status in described:
             # Profiles are YAML files: build the device off the event loop.
             device = await self.hass.async_add_executor_job(partial(
                 HaierDevice.create,
@@ -183,10 +259,26 @@ class Haier:
                 device_title=info["title"],
                 backend_data=status,
             ))
-            self.devices.append(device)
+            device.device_type = info["type"]
+            devices.append(device)
             _LOGGER.info("Added device: %s", device)
-        if not self.devices:
-            raise HaierEmptyDeviceList("No device status could be read")
+        return devices
+
+    def cache_dict(self) -> dict:
+        """What the next start needs when the cloud does not answer."""
+        return {
+            "devices": [
+                {
+                    "mac": device.device_id,
+                    "type": device.device_type,
+                    "serial": device.device_serial or "",
+                    "title": device.device_name or "",
+                    "status": device.status_data,
+                }
+                for device in self.devices
+                if isinstance(device.status_data, dict)
+            ]
+        }
 
     def start(self, entry: ConfigEntry) -> None:
         self._entry = entry
@@ -199,6 +291,53 @@ class Haier:
             self.hass, self._async_periodic_refresh, C.REST_REFRESH_INTERVAL,
             name=f"{C.DOMAIN} refresh", cancel_on_shutdown=True,
         ))
+        if self.from_cache:
+            self._create_task(self._async_wait_for_cloud(entry), "cloud check")
+
+    async def _async_cloud_ready(self) -> bool:
+        """The cloud answers what a setup needs: a device list and every status.
+
+        Checked as the setup does it, so a reload does not just fall back to the
+        saved descriptions again (and again, every few seconds).
+        """
+        found = parse_device_list(await self.client.async_get_devices_page())
+        if not found:
+            return False
+        for info in found:
+            try:
+                await self.client.async_get_device_status(info["mac"])
+            except HaierApiError:
+                continue  # skipped by the setup as well (stale entries, CR-T-039)
+        return True
+
+    async def _async_wait_for_cloud(self, entry: ConfigEntry) -> None:
+        """Started from the saved descriptions: reload once the cloud answers.
+
+        The reload reads the device list and statuses from the cloud again, so
+        devices added or removed in the app meanwhile show up.
+        """
+        delay = C.CACHE_RETRY_FIRST
+        while not self._stopping:
+            await asyncio.sleep(delay)
+            try:
+                ready = await self._async_cloud_ready()
+            except HaierAuthError:
+                _LOGGER.error("Haier Evo rejected the credentials, re-authentication is required")
+                entry.async_start_reauth(self.hass)
+                return
+            except HaierRateLimitError as err:
+                delay = min(max(delay * 2, err.retry_after), C.CACHE_RETRY_MAX)
+                continue
+            except HaierError as err:
+                _LOGGER.debug("Haier Evo cloud still not available: %s", err)
+                delay = min(delay * 2, C.CACHE_RETRY_MAX)
+                continue
+            if not ready:
+                delay = min(delay * 2, C.CACHE_RETRY_MAX)
+                continue
+            _LOGGER.info("Haier Evo cloud is back, reloading to read the devices from it")
+            self.hass.config_entries.async_schedule_reload(entry.entry_id)
+            return
 
     def _create_task(self, coro: Any, name: str) -> None:
         # Entry background tasks are cancelled on unload.
@@ -297,6 +436,26 @@ class Haier:
             raise HaierConnectionError(f"WebSocket connect failed: {type(err).__name__}") from None
 
         outage = None if self._disconnected_since is None else self._now() - self._disconnected_since
+        received = False
+
+        def silent_check() -> None:
+            # The cloud pushes statuses within seconds of an opening; a session
+            # nothing came over is accepted but not served (JampireX, AGrigorii):
+            # commands get no answer, pushes never come. Replace it.
+            if received or ws.closed or self._ws is not ws:
+                return
+            self._silent_sessions += 1
+            log = _LOGGER.info if self._silent_sessions == 1 else _LOGGER.debug
+            log("Nothing came over the WebSocket since it opened, opening a new one "
+                "(silent sessions in a row: %s)", self._silent_sessions)
+            if self._silent_sessions == C.WS_SILENT_SESSIONS_FRESH_TOKEN:
+                self.client.invalidate_access_token(token)
+            self._connected.clear()
+            self._create_task(ws.close(), "close silent")
+
+        silent_timer = self.hass.loop.call_later(
+            C.WS_SILENT_SESSION_TIMEOUT * 2 ** min(self._silent_sessions, 3), silent_check
+        )
         self._ws = ws
         self._disconnected_since = None
         self._cancel_unavailable_timer()
@@ -311,16 +470,25 @@ class Haier:
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
+                    if not received:
+                        received = True
+                        self._silent_sessions = 0
                     self._handle_message(msg.data)
                 elif msg.type == WSMsgType.ERROR:
                     break
         finally:
+            silent_timer.cancel()
             self._connected.clear()
             if self._ws is ws:
                 self._ws = None
             if not ws.closed:
                 await ws.close()
             _LOGGER.debug("WebSocket closed, code %s", ws.close_code)
+        if ws.close_code == C.WS_CLOSE_TOKEN_REFUSED:
+            # The gateway took the upgrade and then refused the token: without
+            # this the same token was tried until it expired locally (up to an hour).
+            _LOGGER.info("The WebSocket was closed for the token (code %s), renewing it", ws.close_code)
+            self.client.invalidate_access_token(token)
 
     async def _async_periodic_refresh(self, _now: Any = None) -> None:
         await self._async_resync()
@@ -342,6 +510,8 @@ class Haier:
                 continue
             device.update_from_backend(status)
             device.notify()
+        if devices is None and self.on_refreshed is not None:
+            self.on_refreshed()
 
     def _handle_message(self, raw: str) -> None:
         try:
@@ -384,11 +554,30 @@ class Haier:
                     command = self._pending.pop(pending_trace)
                     break
         if err not in (None, 0, "0"):
-            _LOGGER.warning("Haier Evo rejected a command, errNo=%s", err)
-            # The entity already shows the requested value: read the real one back.
             mac = message.get("macAddress") or (command or {}).get("macAddress") or ""
-            if (device := self.get_device_by_id(mac)) is not None:
-                self._create_task(self._async_resync([device]), "resync")
+            device = self.get_device_by_id(mac)
+            if command is None or device is None:
+                _LOGGER.warning("Haier Evo rejected a command, errNo=%s", err)
+            if device is not None:
+                # The entity already shows the requested value: read the real one back.
+                self._create_task(self._async_check_rejected(device, command, err), "resync")
+
+    async def _async_check_rejected(self, device: HaierDevice, command: dict | None, err: Any) -> None:
+        """Read the real state after a non-zero errNo; warn only if the unit lacks the values."""
+        try:
+            status = await self.client.async_get_device_status(device.device_id)
+        except HaierError as error:
+            if command is not None:
+                _LOGGER.warning("Haier Evo rejected a command, errNo=%s", err)
+            _LOGGER.debug("Resync of %s failed: %s", device.device_name, error)
+            return
+        if command is not None:
+            if command_applied(command, status):
+                _LOGGER.debug("errNo=%s, but %s already has the requested values", err, device.device_name)
+            else:
+                _LOGGER.warning("Haier Evo rejected a command, errNo=%s", err)
+        device.update_from_backend(status)
+        device.notify()
 
     async def _async_ack_watchdog(
         self, trace: str, payload: dict, sent_ws: ClientWebSocketResponse
@@ -490,6 +679,7 @@ class HaierDevice:
         self.device_serial = device_serial
         self.device_name = device_title
         self.device_model = "UNKNOWN"
+        self.device_type = "UNKNOWN"
         self.sw_version = None
         self._listeners: list[Callable[[], None]] = []
         self._online = True

@@ -212,8 +212,12 @@ class HaierClient:
                 data=data,
                 headers=self._headers(),
                 timeout=ClientTimeout(total=C.API_TIMEOUT),
+                # The sign-in form carries the password: never follow it elsewhere.
+                allow_redirects=False,
             ) as resp:
                 status = resp.status
+                if 300 <= status < 400:
+                    raise HaierConnectionError(f"Auth endpoint redirected (HTTP {status})")
                 if status == 429:
                     raise HaierRateLimitError(_retry_after(resp, self._login_backoff))
                 if status >= 500:
@@ -338,9 +342,14 @@ class HaierClient:
                     url,
                     headers={**self._headers(token), "Content-Type": "application/json"},
                     timeout=ClientTimeout(total=C.API_TIMEOUT),
+                    # X-Auth-Token and Device-Id would go along to the redirect
+                    # target; the cloud's endpoints never redirect.
+                    allow_redirects=False,
                 ) as resp:
                     status = resp.status
-                    if status == 401:
+                    if 300 <= status < 400:
+                        raise HaierConnectionError(f"HTTP {status} redirect")
+                    elif status == 401:
                         pass  # handled below, outside the response context
                     elif status == 429:
                         raise HaierRateLimitError(_retry_after(resp, C.LOGIN_LIMIT_429))
