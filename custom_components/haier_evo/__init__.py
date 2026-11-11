@@ -4,8 +4,9 @@ import json
 import os
 import re
 import uuid
+from collections.abc import Callable
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
@@ -51,8 +52,15 @@ def token_store(hass: HomeAssistant, entry_id: str) -> Store:
 
 
 def devices_store(hass: HomeAssistant, entry_id: str) -> Store:
-    """Device descriptions of the last good start (MACs, serials: private too)."""
-    return Store(hass, CACHE_VERSION, f"{DOMAIN}.{entry_id}.devices", private=True)
+    """Device descriptions of the last good start (MACs, serials: private too).
+
+    Written up to once a minute while pushes come, so the writes are atomic: a
+    power cut in the middle of one must not leave a broken file for the very
+    start that needs it.
+    """
+    return Store(
+        hass, CACHE_VERSION, f"{DOMAIN}.{entry_id}.devices", private=True, atomic_writes=True
+    )
 
 
 def _known_macs(hass: HomeAssistant, entry: ConfigEntry) -> set[str]:
@@ -128,11 +136,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: HaierConfigEntry) -> Non
                 raise ConfigEntryNotReady(str(err)) from err
             raise ConfigEntryNotReady(f"Haier Evo cloud is unavailable: {err}") from err
     else:
-        _check_complete(hass, entry, haier)
+        await _async_check_complete(hass, entry, haier, cache)
         await cache.async_save(haier.cache_dict())
 
     haier.cache_store = cache
-    haier.on_refreshed = lambda: cache.async_delay_save(haier.cache_dict, CACHE_SAVE_DELAY)
+    haier.on_refreshed = _cache_saver(haier, cache)
     entry.runtime_data = haier
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     haier.start(entry)
@@ -167,17 +175,62 @@ async def _async_setup_from_cache(haier: api.Haier, cache: Store, err: Exception
     return True
 
 
-def _check_complete(hass: HomeAssistant, entry: ConfigEntry, haier: api.Haier) -> None:
+def _cache_saver(haier: api.Haier, cache: Store) -> Callable[[], None]:
+    """Schedules a write of the saved descriptions CACHE_SAVE_DELAY s from now.
+
+    Called after a REST refresh and after every push. A call while a write is
+    already scheduled does nothing: Store.async_delay_save restarts its timer
+    on every call, and pushes coming more often than the delay would put the
+    write off for ever.
+    """
+    pending = False
+
+    def data() -> dict:
+        nonlocal pending
+        pending = False
+        return haier.cache_dict()
+
+    def schedule() -> None:
+        nonlocal pending
+        if pending:
+            return
+        pending = True
+        cache.async_delay_save(data, CACHE_SAVE_DELAY)
+
+    return schedule
+
+
+async def _async_check_complete(
+    hass: HomeAssistant, entry: ConfigEntry, haier: api.Haier, cache: Store
+) -> None:
     """Fewer devices than the registry knows: retry the setup a few times.
 
     The cloud sometimes leaves a unit out of the list or does not describe it
     right after an outage; starting without it would make its entities
     disappear until the next restart.
+
+    A unit that stays away is waited for once, not at every start: the ones a
+    setup gave up on are kept with the saved descriptions (CR-T-071).
     """
     found = {str(device.device_id).lower() for device in haier.devices}
-    missing = _known_macs(hass, entry) - found
+    # A unit the cloud returned but this code could not read is not missing:
+    # a retry reads the same description, and it is not gone from the account.
+    missing = _known_macs(hass, entry) - found - haier.unreadable
     if not missing:
         _INCOMPLETE_SETUPS.pop(entry.entry_id, None)
+        return
+    try:
+        given_up = api.saved_missing(await cache.async_load())
+    except Exception:  # noqa: BLE001 - an unreadable file only costs the retries
+        given_up = set()
+    if missing <= given_up:
+        _INCOMPLETE_SETUPS.pop(entry.entry_id, None)
+        haier.missing = missing
+        _LOGGER.info(
+            "Haier Evo does not return %s, as at the last start; "
+            "delete the device in Home Assistant if it is gone from the Evo app",
+            ", ".join(sorted(missing)),
+        )
         return
     attempts = _INCOMPLETE_SETUPS.get(entry.entry_id, 0) + 1
     if attempts <= SETUP_INCOMPLETE_RETRIES:
@@ -187,10 +240,31 @@ def _check_complete(hass: HomeAssistant, entry: ConfigEntry, haier: api.Haier) -
             f"(attempt {attempts}/{SETUP_INCOMPLETE_RETRIES})"
         ))
     _INCOMPLETE_SETUPS.pop(entry.entry_id, None)
+    haier.missing = missing
     _LOGGER.warning(
         "Haier Evo still does not return %s, starting with the %d device(s) it returned; "
-        "remove a device in Home Assistant if it is gone from the Evo app",
+        "delete the device in Home Assistant (its page, the menu, Delete) if it is gone from the Evo app",
         ", ".join(sorted(missing)), len(found),
+    )
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: HaierConfigEntry, device_entry: dr.DeviceEntry
+) -> bool:
+    """A device may be deleted in the UI once the cloud no longer returns it.
+
+    Without this hook Home Assistant offers no way to delete a device, and a
+    unit removed from the Evo account stayed in the registry for good (CR-T-071).
+    """
+    haier = getattr(entry, "runtime_data", None)
+    if entry.state is not ConfigEntryState.LOADED or haier is None:
+        # Not loaded: there is no telling which units the cloud still has, and
+        # deleting a live one loses its name, area and disabled entities.
+        return False
+    live = {str(device.device_id).lower() for device in haier.devices} | haier.unreadable
+    return not any(
+        domain == DOMAIN and str(identifier).lower() in live
+        for domain, identifier in device_entry.identifiers
     )
 
 

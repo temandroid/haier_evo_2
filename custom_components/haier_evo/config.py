@@ -320,21 +320,27 @@ class Attribute(dict):
 
     @property
     def type(self) -> str:
-        return self.get("type", "").lower()
+        return str(self.get("type") or "").lower()
 
     @property
     def list(self) -> list[Item]:
-        data = self.get("list", {}).get("data")
-        return [Item.create(self.name, v) for v in data] if data else []
+        # "list": null and junk entries read as "no list" (CR-T-070).
+        values = self.get("list")
+        data = values.get("data") if isinstance(values, dict) else None
+        if not isinstance(data, list):
+            return []
+        return [Item.create(self.name, v) for v in data if isinstance(v, dict)]
 
     @list.setter
     def list(self, value) -> None:
-        self.setdefault("list", {})["data"] = value
+        if not isinstance(self.get("list"), dict):
+            self["list"] = {}
+        self["list"]["data"] = value
 
     @property
     def range(self) -> Range | None:
         value = self.get("range")
-        return Range(value) if value else None
+        return Range(value) if value and isinstance(value, dict) else None
 
     @range.setter
     def range(self, value: dict) -> None:
@@ -392,7 +398,8 @@ class Range(dict):
 
     @property
     def data(self) -> dict:
-        return self.get("data", {})
+        data = self.get("data")
+        return data if isinstance(data, dict) else {}
 
     @property
     def min_value(self) -> int | float | str | None:
@@ -563,21 +570,21 @@ class Constraint(list):
         command_value = command.get("value")
         additionals = []
         for item in self:
-            cond = item.get("pendingCondition", {})
-            for cond_command in cond.get("commands", []):
+            cond = item.get("pendingCondition") or {}
+            for cond_command in cond.get("commands") or []:
                 if command_code != cond_command.get("commandName"):
                     continue
-                values = [self.value2code(x) for x in cond_command.get("values")]
+                values = [self.value2code(x) for x in cond_command.get("values") or []]
                 if command_value not in values:
                     continue
-                additionals.append(item.get("additionalCommands", {}))
+                additionals.append(item.get("additionalCommands") or {})
         return additionals
 
     def merge_commands(self, command: dict, additionals: list[dict]) -> list[dict]:
         commands = {"PREPEND": [], "APPEND": []}
         for additional in additionals:
             merge_type = additional.get("mergeType")
-            additional_commands = [self.format_command(x) for x in additional.get("commands", [])]
+            additional_commands = [self.format_command(x) for x in additional.get("commands") or []]
             target = commands.get(merge_type, [])
             target.extend(filter(
                 lambda c: c not in target,

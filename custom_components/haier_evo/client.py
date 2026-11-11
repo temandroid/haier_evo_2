@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import quote, urljoin
@@ -64,10 +65,18 @@ def parse_expire(value: Any) -> datetime | None:
 
 
 def _retry_after(resp: ClientResponse, default: float) -> float:
+    """Seconds to wait after a 429, between 1 s and LOGIN_LIMIT_MAX.
+
+    The header is not trusted beyond that: "864000" from a proxy in front of
+    the cloud would close the login for ten days, "inf" until a restart (CR-T-075).
+    """
     try:
-        return max(float(resp.headers.get("Retry-After", default)), 1.0)
+        value = float(resp.headers.get("Retry-After", default))
     except (TypeError, ValueError):
-        return default
+        value = float(default)
+    if not math.isfinite(value):
+        value = float(default)
+    return min(max(value, 1.0), float(C.LOGIN_LIMIT_MAX))
 
 
 class HaierClient:

@@ -98,6 +98,14 @@ def parse_device_list(data: dict) -> list[dict[str, str]]:
     return devices
 
 
+def saved_missing(cached: Any) -> set[str]:
+    """MACs a setup gave up waiting for, as kept with the saved descriptions."""
+    items = cached.get("missing") if isinstance(cached, dict) else None
+    if not isinstance(items, list):
+        return set()
+    return {item.lower() for item in items if isinstance(item, str)}
+
+
 def _normalized(value: Any) -> str:
     text = str(value).strip().lower()
     return {"true": "1", "false": "0"}.get(text, text)
@@ -150,8 +158,20 @@ class Haier:
         self.device_list: list[dict[str, str]] = []
         # Built from the saved descriptions: the cloud did not answer at start.
         self.from_cache = False
-        # Called after a full REST refresh: the statuses are worth saving.
+        # MACs (lower case) of units Home Assistant knows and the cloud no
+        # longer returns, which a setup has already stopped waiting for. Kept
+        # with the saved descriptions, so the next start does not wait again.
+        self.missing: set[str] = set()
+        # MACs (lower case) of units the cloud does return, but whose
+        # description this code could not read. They are not "missing": no
+        # setup waits for them and they must not be deleted as gone.
+        self.unreadable: set[str] = set()
+        # Called after a full REST refresh and after a push: the statuses are
+        # worth saving.
         self.on_refreshed: Callable[[], None] | None = None
+        # Causes of failed connection attempts already reported in this
+        # outage: a repeat of one goes to the debug log.
+        self._outage_causes: set[str] = set()
         # Store of the saved descriptions (set by the entry setup).
         self.cache_store: Any = None
         self._silent_sessions = 0
@@ -244,24 +264,44 @@ class Haier:
         await self.client.async_load_tokens()
         self.devices = await self._async_build_devices(described)
         self.device_list = [info for info, _ in described]
+        self.missing = saved_missing(cached)
         self.from_cache = True
 
     async def _async_build_devices(self, described: list[tuple[dict, dict]]) -> list[HaierDevice]:
         devices = []
+        failure: Exception | None = None
         for info, status in described:
-            # Profiles are YAML files: build the device off the event loop.
-            device = await self.hass.async_add_executor_job(partial(
-                HaierDevice.create,
-                haier=self,
-                device_type=info["type"],
-                device_mac=info["mac"],
-                device_serial=info["serial"],
-                device_title=info["title"],
-                backend_data=status,
-            ))
+            try:
+                # Profiles are YAML files: build the device off the event loop.
+                device = await self.hass.async_add_executor_job(partial(
+                    HaierDevice.create,
+                    haier=self,
+                    device_type=info["type"],
+                    device_mac=info["mac"],
+                    device_serial=info["serial"],
+                    device_title=info["title"],
+                    backend_data=status,
+                ))
+            except Exception as err:  # noqa: BLE001 - one odd description must not take the others down
+                # A description this code cannot read (a new device type, a
+                # changed format) used to fail the whole entry, every working
+                # unit included, with no retry (CR-T-070).
+                failure = err
+                self.unreadable.add(str(info["mac"]).lower())
+                _LOGGER.warning(
+                    "Skipping device %s: its description is not readable (%s: %s); "
+                    "the debug log has the details",
+                    info["title"] or info["mac"], type(err).__name__, err,
+                )
+                _LOGGER.debug("Description of %s failed to load", info["title"] or info["mac"], exc_info=err)
+                continue
             device.device_type = info["type"]
             devices.append(device)
             _LOGGER.info("Added device: %s", device)
+        if failure is not None and not devices:
+            # Nothing at all could be read: that is not an outage a retry or
+            # the saved descriptions would cure, so it fails as it did before.
+            raise failure
         return devices
 
     def cache_dict(self) -> dict:
@@ -277,7 +317,8 @@ class Haier:
                 }
                 for device in self.devices
                 if isinstance(device.status_data, dict)
-            ]
+            ],
+            "missing": sorted(self.missing),
         }
 
     def start(self, entry: ConfigEntry) -> None:
@@ -408,10 +449,11 @@ class Haier:
                     self._entry.async_start_reauth(self.hass)
                 return
             except HaierRateLimitError as err:
-                _LOGGER.warning("Haier Evo: %s", err)
+                # The text carries the seconds left: one cause whatever they are.
+                self._log_outage("Haier Evo: %s", err, cause="rate limit")
                 delay = err.retry_after
             except HaierError as err:
-                _LOGGER.warning("Haier Evo WebSocket: %s", err)
+                self._log_outage("Haier Evo WebSocket: %s", err)
             except Exception:  # noqa: BLE001 - keep the loop alive whatever happens
                 _LOGGER.exception("Unexpected Haier Evo WebSocket error")
             self._mark_disconnected()
@@ -425,6 +467,18 @@ class Haier:
             with suppress(TimeoutError):
                 await asyncio.wait_for(self._wakeup.wait(), delay)
             self._wakeup.clear()
+
+    def _log_outage(self, message: str, err: Exception, cause: str | None = None) -> None:
+        """One warning per cause per outage (CR-T-076).
+
+        The attempts go on once a minute for as long as the outage lasts. A
+        cause not seen in it yet is still a warning: an outage that starts as
+        a network error and turns into a refused handshake must show that.
+        """
+        cause = cause or str(err)
+        log = _LOGGER.debug if cause in self._outage_causes else _LOGGER.warning
+        self._outage_causes.add(cause)
+        log(message, err)
 
     async def _async_ws_session(self) -> None:
         token = await self.client.async_get_token()
@@ -467,6 +521,9 @@ class Haier:
         self._connected.set()
         if self._ever_connected:
             self.reconnects += 1
+        if self._outage_causes:
+            self._outage_causes.clear()
+            _LOGGER.info("Haier Evo cloud connection is back")
         _LOGGER.debug("WebSocket connected")
         if self._ever_connected and outage is not None and outage > C.WS_RESYNC_AFTER:
             self._create_task(self._async_resync(), "resync")
@@ -532,9 +589,26 @@ class Haier:
                 self._handle_ack(message)
             device = self.get_device_by_id(message.get("macAddress") or "")
             if device is None:
-                _LOGGER.debug("Message for an unknown device: %s", message.get("event"))
+                mac = str(message.get("macAddress") or "").lower()
+                if mac in self.missing:
+                    # A unit a setup stopped waiting for is alive after all.
+                    # Forget that it was given up on, or the next start would
+                    # not wait for it either if the cloud is slow to list it.
+                    self.missing.discard(mac)
+                    _LOGGER.info(
+                        "Haier Evo unit %s is back in the cloud; reload the integration to add it", mac
+                    )
+                    if self.on_refreshed is not None:
+                        self.on_refreshed()
+                else:
+                    _LOGGER.debug("Message for an unknown device: %s", message.get("event"))
                 return
             device.on_message(message)
+            if message.get("event") in ("status", "deviceStatusEvent") and self.on_refreshed is not None:
+                # What came over the socket is worth saving too: a stop of Home
+                # Assistant unloads nothing, so without this the file kept the
+                # last REST snapshot, up to 15 minutes old (CR-T-073).
+                self.on_refreshed()
         except Exception:  # noqa: BLE001 - one bad message must not kill the socket
             _LOGGER.exception("Failed to handle %s message", message.get("event"))
 
@@ -622,6 +696,10 @@ class Haier:
     async def _async_wait_connected(self, wait: float) -> ClientWebSocketResponse | None:
         if self.connected:
             return self._ws
+        # The socket may be closed already while its session has not cleaned up
+        # yet: the event is still set then, and waiting on it would return at
+        # once and fail the command instead of waiting for the reconnect (CR-T-072).
+        self._connected.clear()
         self._wakeup.set()
         try:
             await asyncio.wait_for(self._connected.wait(), wait)
@@ -783,13 +861,20 @@ class HaierDevice:
 
     def _get_status(self, data: dict) -> dict:
         self._status_data = data = (data or {})
-        info = data.setdefault("info", {})
-        self.device_serial = info.setdefault("serialNumber", self.device_serial)
-        device_model = info.get("model") or "AC"
+        # "status" and "settings" may come as null: read them as "not there"
+        # (CR-T-070). Not "info": the model in it is a part of every unique_id,
+        # and a unit described without it would come up a second time as
+        # "<mac>_AC", next to the entities it already has. Such a description
+        # is unreadable, and the unit is skipped.
+        info = data.get("info", {})
+        if not isinstance(info, dict):
+            raise ValueError("the description has no device info")
+        self.device_serial = info.get("serialNumber") or self.device_serial
+        device_model = str(info.get("model") or "AC")
         device_model = device_model.replace('-', '').replace('/', '')[:11]
         self.device_model = device_model
-        self.available = data.setdefault("status", "ONLINE")
-        settings = data.setdefault("settings", {})
+        self.available = data.get("status") or "ONLINE"
+        settings = data.get("settings") or {}
         self.device_name = (settings.get("name") or {}).get("name") or self.device_name
         self.sw_version = (settings.get("firmware") or {}).get("value")
         self._set_alarms(data.get("alarms"))
@@ -1133,14 +1218,13 @@ class HaierAC(HaierDevice):
 
     def _load_config_from_attributes(self, data: dict) -> None:
         self._config = CFG.HaierACConfig(self.device_model, self.hass.config.path(C.DOMAIN))
-        attributes = data.setdefault("attributes", [])
-        sensors = data.setdefault("sensors", {}).get("items", [])
+        sensors = (data.get("sensors") or {}).get("items") or []
         sensor_curr_temp = next(filter(lambda i: (
             isinstance(i, dict)
             and isinstance(i.get("value"), dict)
             and i.get("value", {}).get("description") == "indoorTemperature"
         ), sensors), {}).get("value", {}).get("name")
-        attrs = list(sorted(map(lambda x: CFG.Attribute(x), attributes), key=lambda x: x.code))
+        attrs = _described_attributes(data)
         room_seen = False
         for attr in attrs:
             if attr.name == "current_temperature":
@@ -1166,7 +1250,9 @@ class HaierAC(HaierDevice):
                 self.max_temperature = parsefloat(attr.range.max_value, self.max_temperature)
                 self.target_temperature_step = parsefloat(attr.range.step, 1.0) or 1.0
             _LOGGER.debug("%s: %s", self.device_name, attr)
-        self.constraint.extend(data.setdefault("constraint", []))
+        self.constraint.extend(
+            item for item in data.get("constraint") or [] if isinstance(item, dict)
+        )
 
     def _get_status(self, data: dict) -> dict:
         data = super()._get_status(data)
@@ -1364,19 +1450,25 @@ class HaierAC(HaierDevice):
         self._deferred_temperature = None
         self.target_temperature = float(value)
 
-    async def switch_on(self, value: str = None) -> None:
-        value = str(value or self.mode or HVACMode.AUTO)
-        if self.status and value != self.mode:
+    async def switch_on(self, value: str | None = None) -> None:
+        # Without a mode asked for, the unit keeps the one it has. A mode this
+        # profile does not know (self.mode is None) is left alone: sending
+        # "auto" in its place changed the mode of the unit on a plain turn-on
+        # (CR-T-074).
+        mode = str(value) if value else self.mode
+        if mode is not None and self.status and mode != self.mode:
             # Turning on is never locked; a mode change on a running unit may be.
-            self._check_writable("mode", value)
+            self._check_writable("mode", mode)
+        mode_commands = self.get_commands("mode", mode) if mode is not None else []
         # Always send status=on: our idea of "already on" may be stale, and
         # then a mode change alone does not start the unit (MaxSezin fork).
         await self._send_commands([
             *self._status_commands("on"),
-            *self.get_commands("mode", value),
+            *mode_commands,
         ])
         self.status = 1
-        self.mode = value
+        if mode_commands:
+            self.mode = mode
         if (deferred := self._deferred_temperature) is not None:
             self._deferred_temperature = None
             try:
@@ -1571,8 +1663,7 @@ class HaierREF(HaierDevice):
 
     def _load_config_from_attributes(self, data: dict) -> None:
         self._config = CFG.HaierREFConfig(self.device_model, self.hass.config.path(C.DOMAIN))
-        attributes = data.setdefault("attributes", [])
-        attrs = list(sorted(map(lambda x: CFG.Attribute(x), attributes), key=lambda x: x.code))
+        attrs = _described_attributes(data)
         for attr in attrs:
             self.config.attrs.append(attr)
         self.config.merge_attributes()
@@ -1727,8 +1818,7 @@ class HaierWM(HaierDevice):
 
     def _load_config_from_attributes(self, data: dict) -> None:
         self._config = CFG.HaierWMConfig(self.device_model, self.hass.config.path(C.DOMAIN))
-        attributes = data.setdefault("attributes", [])
-        attrs = list(sorted(map(lambda x: CFG.Attribute(x), attributes), key=lambda x: x.code))
+        attrs = _described_attributes(data)
         for attr in attrs:
             self.config.attrs.append(attr)
         self.config.merge_attributes()
@@ -1794,6 +1884,14 @@ class HaierWM(HaierDevice):
         if self.config['status'] is not None:
             entities.append(sensor.HaierWMStatusSensor(self))
         return entities
+
+
+def _described_attributes(data: dict) -> list[CFG.Attribute]:
+    """The attributes of a status, by code; "attributes": null and junk entries are skipped."""
+    return sorted(
+        (CFG.Attribute(item) for item in data.get("attributes") or [] if isinstance(item, dict)),
+        key=lambda attr: attr.code,
+    )
 
 
 def parsebool(value) -> bool:
