@@ -37,3 +37,27 @@ WS_RESYNC_AFTER = 30
 WS_ACK_TIMEOUT = 10
 # Safety net against a session that stays open but goes silent.
 REST_REFRESH_INTERVAL = timedelta(minutes=15)
+# A session the cloud has sent nothing over for this long since it opened is
+# accepted but not served (the cloud pushes statuses within seconds of an
+# opening): it is replaced. The timeout doubles with every silent session in a
+# row (up to 8x), the WS_SILENT_SESSIONS_FRESH_TOKEN-th one goes with a renewed token.
+WS_SILENT_SESSION_TIMEOUT = 60
+WS_SILENT_SESSIONS_FRESH_TOKEN = 2
+# The gateway may accept the upgrade and then close with this code
+# ("Auth token not valid!"): the token is refused.
+WS_CLOSE_TOKEN_REFUSED = 1007
+
+# Setups in a row that may retry because the cloud listed fewer devices than
+# the device registry knows, before the entry starts with what it got.
+SETUP_INCOMPLETE_RETRIES = 3
+
+# Device descriptions of the last good start live in
+# .storage/haier_evo.<entry_id>.devices. When the cloud is not reachable at
+# start, the entry is built from them; the cloud is then polled (from
+# CACHE_RETRY_FIRST s, doubling up to CACHE_RETRY_MAX s) and the entry reloaded
+# from it once it answers. Statuses are written back CACHE_SAVE_DELAY s after
+# a refresh.
+CACHE_VERSION = 1
+CACHE_RETRY_FIRST = 5
+CACHE_RETRY_MAX = 300
+CACHE_SAVE_DELAY = 60
