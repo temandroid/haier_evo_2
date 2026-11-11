@@ -303,12 +303,17 @@ class Haier:
         found = parse_device_list(await self.client.async_get_devices_page())
         if not found:
             return False
+        read = 0
         for info in found:
             try:
                 await self.client.async_get_device_status(info["mac"])
             except HaierApiError:
                 continue  # skipped by the setup as well (stale entries, CR-T-039)
-        return True
+            read += 1
+        # A list whose every status is refused (403 from iot-platform while the
+        # smartHome page answers) builds no device either: the reload would
+        # come back from the cache and find the cloud "ready" again (CR-T-063).
+        return read > 0
 
     async def _async_wait_for_cloud(self, entry: ConfigEntry) -> None:
         """Started from the saved descriptions: reload once the cloud answers.
@@ -809,6 +814,26 @@ class HaierDevice:
     def _set_attribute_value(self, code: str, value: str) -> None:
         pass
 
+    def _remember_pushed(self, properties: dict, alarms: Any = None) -> None:
+        """Write pushed values into the status snapshot the cache saves (CR-T-067).
+
+        REST comes every 15 minutes; without this a start from the cache showed
+        the state of the last snapshot, not what the entities already showed.
+        """
+        data = self._status_data
+        if not isinstance(data, dict):
+            return
+        by_name = {
+            str(attr.get("name")): attr
+            for attr in data.get("attributes") or []
+            if isinstance(attr, dict)
+        }
+        for key, value in properties.items():
+            if value is not None and (attr := by_name.get(str(key))) is not None:
+                attr["currentValue"] = value
+        if alarms is not None:
+            data["alarms"] = alarms
+
     def _handle_status_update(self, received_message: dict) -> None:
         statuses = (received_message.get("payload") or {}).get("statuses") or []
         self.changed_at = time.monotonic()
@@ -817,19 +842,26 @@ class HaierDevice:
                 if not isinstance(status, dict):
                     continue
                 properties = status.get("properties")
-                for key, value in (properties if isinstance(properties, dict) else {}).items():
+                properties = properties if isinstance(properties, dict) else {}
+                for key, value in properties.items():
                     self._set_attribute_value(key, value)
                 if "alarms" in status:
                     self._set_alarms(status["alarms"])
-            self.available = True
+                self._remember_pushed(properties, status.get("alarms"))
+            # Availability is deviceStatusEvent's (and REST's) business: a status
+            # packet trailing an OFFLINE must not bring the unit back (CR-T-065).
         finally:
             # Whatever was applied before a malformed entry still reaches the UI.
             self.notify()
 
     def _handle_device_status_update(self, received_message: dict) -> None:
         status = (received_message.get("payload") or {}).get("status")
+        # A REST snapshot requested before this event is older than it (CR-T-065).
+        self.changed_at = time.monotonic()
         if status is not None:
             self.available = status
+            if isinstance(self._status_data, dict):
+                self._status_data["status"] = str(status)
         self.notify()
 
     def _handle_info(self, received_message: dict) -> None:
@@ -1042,16 +1074,24 @@ class HaierAC(HaierDevice):
         # the switches never followed the unit (upstream #67).
         if value is None:
             return
-        self._raw[str(code)] = str(value)
+        code = str(code)
+        previous = self._raw.get(code)
+        self._raw[code] = str(value)
+        is_setpoint = code == str(self.config["target_temperature"])
         if self._deferred_temperature is not None and (
-            (str(code) == str(self.config["status"]) and _norm(value) == "1")
-            or str(code) == str(self.config["target_temperature"])
+            (code == str(self.config["status"]) and _norm(value) == "1")
+            or (is_setpoint and (previous is None or not _same_value(value, previous)))
         ):
-            # Turned on elsewhere, or the cloud reports its own setpoint: the
-            # value kept for our next turn-on is stale and must not pop up later.
+            # Turned on elsewhere, or the cloud reports a setpoint of its own:
+            # the value kept for our next turn-on is stale and must not pop up
+            # later. A repeat of the setpoint the unit already had (a status
+            # packet, a REST resync) is neither (CR-T-064).
             self._deferred_temperature = None
         for attr in self.config.get_attrs_by_code(code):
             self._apply_attribute(attr, value)
+        if is_setpoint and self._deferred_temperature is not None:
+            # Keep showing the setpoint that goes out on turn-on.
+            self.target_temperature = self._deferred_temperature
 
     def _apply_attribute(self, attr: CFG.Attribute, value: str) -> None:
         if attr.name == "current_temperature":
@@ -1101,14 +1141,22 @@ class HaierAC(HaierDevice):
             and i.get("value", {}).get("description") == "indoorTemperature"
         ), sensors), {}).get("value", {}).get("name")
         attrs = list(sorted(map(lambda x: CFG.Attribute(x), attributes), key=lambda x: x.code))
+        room_seen = False
         for attr in attrs:
-            if attr.name == "current_temperature" and str(attr.code) != sensor_curr_temp:
+            if attr.name == "current_temperature":
                 if sensor_curr_temp is None:
-                    continue
-                # The second "room temperature" (code 38 on S2SF and PHP3) follows
-                # the outdoor unit: 11-13 °C on idle units at 8-10 °C outside,
-                # warmer while the unit runs. The indoor one is named in sensors.
-                attr = CFG.Attribute({**attr, "attrname": "outdoor_temperature"})
+                    # No indoorTemperature in sensors: the first one is the room
+                    # temperature. Others are dropped rather than guessed at, or
+                    # the room temperature would jump between them (CR-T-066).
+                    if room_seen:
+                        continue
+                    room_seen = True
+                elif str(attr.code) != sensor_curr_temp:
+                    # The second "room temperature" (code 38 on S2SF and PHP3)
+                    # follows the outdoor unit: 11-13 °C on idle units at 8-10 °C
+                    # outside, warmer while the unit runs. The indoor one is
+                    # named in sensors.
+                    attr = CFG.Attribute({**attr, "attrname": "outdoor_temperature"})
             self.config.attrs.append(attr)
         self.config.merge_attributes()
         for attr in self.config.attrs:
@@ -1568,32 +1616,32 @@ class HaierREF(HaierDevice):
 
     async def set_super_cooling(self, value: bool) -> None:
         if commands := self.get_commands("super_cooling", value):
-            await self._send_single_command(commands[0])
+            await self._send_commands(commands)
             self.super_cooling = value
 
     async def set_super_freeze(self, value: bool) -> None:
         if commands := self.get_commands("super_freeze", value):
-            await self._send_single_command(commands[0])
+            await self._send_commands(commands)
             self.super_freeze = value
 
     async def set_vacation_mode(self, value: bool) -> None:
         if commands := self.get_commands("vacation_mode", value):
-            await self._send_single_command(commands[0])
+            await self._send_commands(commands)
             self.vacation_mode = value
 
     async def set_fridge_mode(self, value: str) -> None:
         if commands := self.get_commands("fridge_mode", value):
-            await self._send_single_command(commands[0])
+            await self._send_commands(commands)
             self.fridge_mode = value
 
     async def set_freezer_mode(self, value: str) -> None:
         if commands := self.get_commands("freezer_mode", value):
-            await self._send_single_command(commands[0])
+            await self._send_commands(commands)
             self.freezer_mode = value
 
     async def set_my_zone(self, value: str) -> None:
         if commands := self.get_commands("my_zone", value):
-            await self._send_single_command(commands[0])
+            await self._send_commands(commands)
             self.my_zone = value
 
     def create_entities_switch(self) -> list:
@@ -1714,17 +1762,17 @@ class HaierWM(HaierDevice):
 
     async def set_program(self, value: str) -> None:
         if commands := self.get_commands("program", value):
-            await self._send_single_command(commands[0])
+            await self._send_commands(commands)
             self.program = value
 
     async def set_temperature(self, value: str) -> None:
         if commands := self.get_commands("temperature", value):
-            await self._send_single_command(commands[0])
+            await self._send_commands(commands)
             self.temperature = value
 
     async def set_spin_speed(self, value: str) -> None:
         if commands := self.get_commands("spin_speed", value):
-            await self._send_single_command(commands[0])
+            await self._send_commands(commands)
             self.spin_speed = value
 
     def create_entities_select(self) -> list:

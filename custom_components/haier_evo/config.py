@@ -525,6 +525,9 @@ class Temperature(Item):
 
     def __init__(self, data: dict) -> None:
         description = (data.get("name") or "").strip()
+        # Per instance: the class dict grew with every description seen, and the
+        # next fridge in the process took them over (CR-T-069).
+        self.mappings = dict(self.mappings)
         self.mappings.setdefault(
             description,
             description.replace("℃", "").strip()
